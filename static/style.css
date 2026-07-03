@@ -1,0 +1,515 @@
+/* RingTaxi Onboard — dark timing-tower aesthetic
+   Palette:
+   ink       #0a0c0f  base background
+   graphite  #15181c  panels
+   graphite2 #1c2025  raised panels / rows
+   steel     #2a2f36  borders, dividers
+   fog       #8d97a1  secondary text
+   paper     #e7eaed  primary text
+   ember     #ff5f1f  accent / active state
+   phosphor  #8fffb0  telemetry digits (speed/altitude)
+*/
+
+:root {
+  --ink: #0a0c0f;
+  --graphite: #15181c;
+  --graphite2: #1b1f24;
+  --steel: #2a2f36;
+  --fog: #8d97a1;
+  --paper: #e7eaed;
+  --ember: #ff5f1f;
+  --ember-dim: #7a3213;
+  --phosphor: #8fffb0;
+
+  --mono: ui-monospace, "Cascadia Mono", "SFMono-Regular", "Roboto Mono", Consolas, monospace;
+  --condensed: "Arial Narrow", "Helvetica Neue Condensed", Oswald, Impact, sans-serif;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--ink);
+  color: var(--paper);
+  font-family: var(--sans);
+}
+
+::selection { background: var(--ember-dim); color: var(--paper); }
+
+/* ---------- topbar ---------- */
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 14px 24px;
+  border-bottom: 1px solid var(--steel);
+  background: linear-gradient(180deg, #101317, var(--ink));
+}
+
+.topbar-mark {
+  font-family: var(--condensed);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+.topbar-title {
+  font-weight: 700;
+  font-size: 1.15rem;
+  color: var(--paper);
+}
+
+.topbar-sep {
+  color: var(--steel);
+  margin: 0 10px;
+}
+
+.topbar-track {
+  color: var(--ember);
+  font-weight: 700;
+  font-size: 1.15rem;
+}
+
+.topbar-date {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  color: var(--fog);
+  letter-spacing: 0.04em;
+}
+
+/* ---------- layout ---------- */
+
+.layout {
+  display: grid;
+  grid-template-columns: 1fr 360px;
+  grid-template-rows: auto auto;
+  gap: 1px;
+  background: var(--steel);
+  padding: 1px;
+}
+
+.video-pane {
+  grid-column: 1;
+  grid-row: 1;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+}
+
+.video-pane video {
+  width: 100%;
+  max-height: 78vh;
+  display: block;
+  background: #000;
+}
+
+.lap-pane {
+  grid-column: 2;
+  grid-row: 1 / 4;
+  background: var(--graphite);
+  padding: 16px;
+  overflow-y: auto;
+  max-height: 88vh;
+}
+
+.telemetry-pane {
+  grid-column: 1;
+  grid-row: 2;
+  background: var(--graphite);
+  display: grid;
+  grid-template-columns: 220px 250px 1fr;
+  gap: 1px;
+  background: var(--steel);
+}
+
+.charts-pane {
+  grid-column: 1;
+  grid-row: 3;
+  background: var(--graphite);
+  padding: 16px 20px;
+}
+
+.readout-block,
+.gball-block,
+.map-block {
+  background: var(--graphite);
+  padding: 16px 20px;
+}
+
+/* ---------- lap list ---------- */
+
+.pane-heading {
+  font-family: var(--condensed);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 0.85rem;
+  color: var(--fog);
+  margin: 0 0 12px;
+  border-bottom: 1px solid var(--steel);
+  padding-bottom: 8px;
+}
+
+.lap-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.lap-card {
+  background: var(--graphite2);
+  border: 1px solid var(--steel);
+  border-left: 4px solid var(--steel);
+  border-radius: 2px;
+  padding: 10px 12px;
+  cursor: pointer;
+  transition: border-color 120ms ease, background-color 120ms ease;
+}
+
+.lap-card:hover {
+  background: #21262c;
+}
+
+.lap-card.is-active {
+  border-left-color: var(--ember);
+  background: #241a12;
+}
+
+.lap-card.is-full {
+  border-color: #2f4633;
+}
+
+.lap-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.lap-number {
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 1rem;
+  color: var(--paper);
+}
+
+.lap-duration {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 1rem;
+  color: var(--paper);
+}
+
+.lap-badge {
+  display: inline-block;
+  margin-top: 6px;
+  font-family: var(--condensed);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.68rem;
+  padding: 2px 6px;
+  border-radius: 2px;
+  background: var(--steel);
+  color: var(--fog);
+}
+
+.lap-card.is-full .lap-badge {
+  background: #1f3a26;
+  color: #7fe39a;
+}
+
+.lap-sectors {
+  margin-top: 8px;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  color: var(--fog);
+}
+
+.lap-sectors div {
+  background: #14171b;
+  border: 1px solid var(--steel);
+  border-radius: 2px;
+  padding: 3px 4px;
+  text-align: center;
+}
+
+.lap-sectors span {
+  display: block;
+  color: var(--fog);
+  font-size: 0.6rem;
+  letter-spacing: 0.05em;
+}
+
+/* ---------- telemetry readouts ---------- */
+
+.readout-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.readout {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.readout-value {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  color: var(--phosphor);
+  text-shadow: 0 0 12px rgba(143, 255, 176, 0.35);
+}
+
+.readout.speed .readout-value { font-size: 3rem; line-height: 1; }
+.readout.altitude .readout-value { font-size: 1.3rem; }
+
+.readout-unit {
+  font-family: var(--condensed);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fog);
+  font-size: 0.75rem;
+}
+
+.readout-label {
+  margin-top: 10px;
+  font-family: var(--condensed);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 0.72rem;
+  color: var(--fog);
+}
+
+.corner-label {
+  margin-top: 4px;
+  font-family: var(--condensed);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--ember);
+  min-height: 1.1em;
+}
+
+.corner-label.is-dim {
+  color: var(--fog);
+  font-weight: 400;
+}
+
+/* ---------- map ---------- */
+
+.map-block {
+  position: relative;
+}
+
+#track-canvas {
+  width: 100%;
+  height: 100%;
+  min-height: 220px;
+  background: #0d1013;
+  border: 1px solid var(--steel);
+  border-radius: 2px;
+  display: block;
+}
+
+.map-caption {
+  position: absolute;
+  top: 24px;
+  left: 32px;
+  font-family: var(--condensed);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.68rem;
+  color: var(--fog);
+}
+
+/* ---------- G-ball (friksjonssirkel) ---------- */
+
+.gball-block {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+#gball-canvas {
+  width: 150px;
+  height: 150px;
+  display: block;
+}
+
+.gball-readouts {
+  display: flex;
+  gap: 18px;
+}
+
+.gball-readout {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.gball-value {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  font-size: 1.05rem;
+  color: var(--paper);
+}
+
+.gball-unit {
+  font-family: var(--condensed);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fog);
+  font-size: 0.62rem;
+}
+
+/* ---------- charts ---------- */
+
+/* Series colors — validated categorical palette against the dark surface
+   #15181c (the dataviz skill's six checks: all PASS for {glat, glon, vertg}
+   as the trio in the G-force chart, worst neighbor ΔE 96.4):
+   speed #199e70 · altitude #3987e5 · lateral g #d95926 · longitudinal g #9085e9 ·
+   vertical g #b8860b */
+:root {
+  --series-speed: #199e70;
+  --series-alt: #3987e5;
+  --series-glat: #d95926;
+  --series-glon: #9085e9;
+  --series-vertg: #b8860b;
+  --gridline: #22262b;
+}
+
+.pane-heading-hint {
+  float: right;
+  letter-spacing: 0.06em;
+  font-size: 0.72rem;
+  color: var(--fog);
+  text-transform: none;
+  font-family: var(--mono);
+}
+
+.chart {
+  margin-bottom: 14px;
+}
+
+.chart:last-child {
+  margin-bottom: 0;
+}
+
+.chart-label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+  font-family: var(--condensed);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 0.72rem;
+  color: var(--fog);
+}
+
+.chart-value {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.78rem;
+  color: var(--paper);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.chart-legend {
+  display: flex;
+  gap: 16px;
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.legend-key {
+  display: inline-block;
+  width: 14px;
+  height: 2px;
+  border-radius: 1px;
+  vertical-align: middle;
+  margin-right: 6px;
+}
+
+.legend-item .legend-key { margin-right: 0; }
+
+.key-speed { background: var(--series-speed); }
+.key-alt   { background: var(--series-alt); }
+.key-glat  { background: var(--series-glat); }
+.key-glon  { background: var(--series-glon); }
+.key-vertg { background: var(--series-vertg); }
+
+.chart-canvas {
+  width: 100%;
+  display: block;
+  background: #0d1013;
+  border: 1px solid var(--steel);
+  border-radius: 2px;
+  cursor: crosshair;
+}
+
+#track-canvas {
+  cursor: crosshair;
+}
+
+/* ---------- statusbar ---------- */
+
+.statusbar {
+  padding: 6px 24px;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--fog);
+  border-top: 1px solid var(--steel);
+}
+
+/* ---------- responsive ---------- */
+
+@media (max-width: 900px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+  .lap-pane {
+    grid-column: 1;
+    grid-row: 2;
+    max-height: none;
+  }
+  .telemetry-pane {
+    grid-column: 1;
+    grid-row: 3;
+    grid-template-columns: 1fr;
+  }
+  .charts-pane {
+    grid-column: 1;
+    grid-row: 4;
+  }
+}
+
+:focus-visible {
+  outline: 2px solid var(--ember);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}

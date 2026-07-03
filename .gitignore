@@ -1,0 +1,18 @@
+# Original RingTaxi recordings (large files + personal data) — not for GitHub
+media/
+
+# Generated files (remuxed video, ~892 MB — can be regenerated from media/ with ffmpeg)
+derived/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local Claude Code settings (machine-specific)
+.claude/settings.local.json*
+
+# Misc
+*.log
+.DS_Store
+Thumbs.db

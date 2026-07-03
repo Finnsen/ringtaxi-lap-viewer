@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RingTaxi Onboard — Nürburgring</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-mark">
+    <span class="topbar-title">RINGTAXI ONBOARD</span>
+    <span class="topbar-sep">·</span>
+    <span class="topbar-track" id="track-name">NÜRBURGRING</span>
+  </div>
+  <div class="topbar-date" id="session-date">—</div>
+</header>
+
+<main class="layout">
+  <section class="video-pane">
+    <video id="player" controls preload="metadata">
+      <source src="/video/20260703_095104957_RNONE-1126.mp4" type="video/mp4">
+    </video>
+  </section>
+
+  <aside class="lap-pane">
+    <h2 class="pane-heading">Laps</h2>
+    <ol class="lap-list" id="lap-list"></ol>
+  </aside>
+
+  <section class="telemetry-pane">
+    <div class="readout-block">
+      <div class="readout speed">
+        <span class="readout-value" id="speed-value">–</span>
+        <span class="readout-unit">km/h</span>
+      </div>
+      <div class="readout altitude">
+        <span class="readout-value" id="alt-value">–</span>
+        <span class="readout-unit">m ASL</span>
+      </div>
+      <div class="readout-label" id="active-lap-label">No lap selected</div>
+      <div class="corner-label" id="corner-name">–</div>
+    </div>
+    <div class="gball-block">
+      <canvas id="gball-canvas" width="200" height="200"></canvas>
+      <div class="gball-readouts">
+        <div class="gball-readout">
+          <span class="gball-value" id="gball-lat">–</span>
+          <span class="gball-unit">g lateral</span>
+        </div>
+        <div class="gball-readout">
+          <span class="gball-value" id="gball-lon">–</span>
+          <span class="gball-unit">g longitudinal</span>
+        </div>
+      </div>
+      <div class="map-caption">G-forces</div>
+    </div>
+    <div class="map-block">
+      <canvas id="track-canvas" width="640" height="360"></canvas>
+      <div class="map-caption">GPS track · click to seek</div>
+    </div>
+  </section>
+
+  <section class="charts-pane">
+    <h2 class="pane-heading">Charts — active lap <span class="pane-heading-hint">click/drag in a chart to seek the video</span></h2>
+    <div class="chart" id="chart-speed">
+      <div class="chart-label">
+        <span class="chart-title"><span class="legend-key key-speed"></span>Speed (km/h)</span>
+        <span class="chart-value" id="chart-value-speed">–</span>
+      </div>
+      <canvas class="chart-canvas" height="110"></canvas>
+    </div>
+    <div class="chart" id="chart-alt">
+      <div class="chart-label">
+        <span class="chart-title"><span class="legend-key key-alt"></span>Altitude (m ASL)</span>
+        <span class="chart-value" id="chart-value-alt">–</span>
+      </div>
+      <canvas class="chart-canvas" height="110"></canvas>
+    </div>
+    <div class="chart" id="chart-g">
+      <div class="chart-label">
+        <span class="chart-title">G-forces (±g)</span>
+        <span class="chart-legend">
+          <span class="legend-item"><span class="legend-key key-glat"></span>Lateral <span class="chart-value" id="chart-value-glat">–</span></span>
+          <span class="legend-item"><span class="legend-key key-glon"></span>Longitudinal <span class="chart-value" id="chart-value-glon">–</span></span>
+          <span class="legend-item"><span class="legend-key key-vertg"></span>Vertical <span class="chart-value" id="chart-value-vertg">–</span></span>
+        </span>
+      </div>
+      <canvas class="chart-canvas" height="130"></canvas>
+    </div>
+  </section>
+</main>
+
+<footer class="statusbar">
+  <span id="status-text">Loading laps …</span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>
