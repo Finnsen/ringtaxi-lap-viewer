@@ -1,33 +1,43 @@
 #!/usr/bin/env python3
 """RingTaxi video player - local server.
 
-Scans media/*.rnz at startup, parses RaceNavigator XML (in memory, without
-writing anything to media/), and exposes a small JSON API plus a range-
-supporting video endpoint for the finished remuxed MP4 file in derived/.
+The media folder and the session (an .mkv plus its .rnz lap files) are chosen
+at runtime through a small folder-picker API (see below) instead of being
+hardcoded. RaceNavigator XML is parsed in memory, without writing anything to
+the selected media folder - it is always treated as read-only (it may live on
+a USB stick). The only thing this server ever writes to is `derived/` (the
+project's own remux cache) and `.rnv-state.json` (remembers the last folder
+used, for the folder picker).
 
-Standard library only - no external dependencies.
+Standard library only - no external dependencies (an optional `imageio-ffmpeg`
+package is used as a fallback if the `ffmpeg` binary isn't on PATH; the app
+degrades gracefully if neither is available).
 """
 
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import mimetypes
+import os
 import re
+import shutil
+import subprocess
 import sys
+import threading
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 MEDIA_DIR = BASE_DIR / "media"
 DERIVED_DIR = BASE_DIR / "derived"
 STATIC_DIR = BASE_DIR / "static"
+STATE_FILE = BASE_DIR / ".rnv-state.json"
 
 NS = {"r": "http://macrix.eu/racenavigator/LapDataSchema"}
 
@@ -135,14 +145,22 @@ class Lap:
 
 # Used to determine whether an incomplete lap is an in-lap or out-lap
 # (the one with the lowest lapNumber among incomplete laps is the in-lap).
+# Scoped to whichever session is currently active (single-user local app).
 min_lap_number_hint: dict = {}
 
 LAPS: dict[int, Lap] = {}
 
-# Track geometry (start/finish/sector lines + corner names) is parsed once at
-# startup from <trackVariant><trackDataXml><definition> - all lap XML files
-# in a session embed the same definition, but we prefer the full lap.
+# Track geometry (start/finish/sector lines + corner names) for the active
+# session, parsed from <trackVariant><trackDataXml><definition> - all lap XML
+# files in a session embed the same definition, but we prefer the full lap.
 TRACK: dict = {}
+
+# Guards LAPS/TRACK/CURRENT while a session switch is in progress.
+SESSION_LOCK = threading.Lock()
+
+# State of the currently active session (folder + video resolution/remux
+# progress). See session_state_payload() for the shape exposed over the API.
+CURRENT: dict = {}
 
 
 def _ref_points(el: ET.Element | None) -> list[dict]:
@@ -192,86 +210,298 @@ def parse_track_geometry(root: ET.Element) -> dict | None:
     return {"lines": lines, "curves": curves}
 
 
-def load_laps() -> None:
-    LAPS.clear()
-    TRACK.clear()
-    incomplete_lap_numbers = []
-    parsed = []
-    track_candidate = None  # (is_full_lap, geometry) - prefers the full lap
+def parse_rnz(rnz_path: Path) -> tuple[Lap, dict | None]:
+    """Parse a single .rnz (zipped RaceNavigator XML) file into a Lap plus
+    the track geometry embedded in it (if any). Read-only: never writes."""
+    with zipfile.ZipFile(rnz_path) as zf:
+        names = [n for n in zf.namelist() if n.lower().endswith(".rn")]
+        if not names:
+            raise ValueError("no .rn entry in archive")
+        xml_bytes = zf.read(names[0])
 
-    for rnz_path in sorted(MEDIA_DIR.glob("*.rnz")):
-        try:
-            with zipfile.ZipFile(rnz_path) as zf:
-                names = [n for n in zf.namelist() if n.lower().endswith(".rn")]
-                if not names:
+    root = ET.fromstring(xml_bytes)
+    lap_el = root.find("r:lap", NS)
+    lap_number = int(lap_el.find("r:lapNumber", NS).text)
+    start_time = parse_dt(lap_el.find("r:startTime", NS).text)
+    end_time = parse_dt(lap_el.find("r:endTime", NS).text)
+    is_start_crossed = lap_el.find("r:isStartLineCrossed", NS).text.strip() == "1"
+    is_end_crossed = lap_el.find("r:isEndLineCrossed", NS).text.strip() == "1"
+
+    geometry = parse_track_geometry(root)
+
+    video_el = root.find("r:videos/r:video", NS)
+    video_file_name = video_el.find("r:fileName", NS).text
+    video_start_time = parse_dt(video_el.find("r:startTime", NS).text)
+
+    sectors = []
+    # Sector times are only meaningful for complete laps (in-laps/out-laps
+    # tend to have empty or truncated sector start/end times).
+    if is_start_crossed and is_end_crossed:
+        lap_sectors_el = root.find("r:lapSectors", NS)
+        if lap_sectors_el is not None:
+            for sec_el in lap_sectors_el.findall("r:lapsector", NS):
+                start_text = sec_el.find("r:startTime", NS).text
+                end_text = sec_el.find("r:endTime", NS).text
+                if not start_text or not end_text:
                     continue
-                xml_bytes = zf.read(names[0])
-        except (zipfile.BadZipFile, KeyError) as exc:
+                sectors.append({
+                    "sectorNumber": int(sec_el.find("r:sectorNumber", NS).text),
+                    "startTime": parse_dt(start_text),
+                    "endTime": parse_dt(end_text),
+                })
+
+    measurements_el = root.find("r:measurements", NS)
+    sm_elements = list(measurements_el.findall("r:sm", NS)) if measurements_el is not None else []
+
+    lap = Lap(
+        lap_number=lap_number,
+        start_time=start_time,
+        end_time=end_time,
+        is_start_crossed=is_start_crossed,
+        is_end_crossed=is_end_crossed,
+        video_file_name=video_file_name,
+        video_start_time=video_start_time,
+        sectors=sectors,
+        measurements_xml=sm_elements,
+    )
+    return lap, geometry
+
+
+def scan_sessions(dir_path: Path) -> list[dict]:
+    """Group the .rnz files directly inside dir_path into sessions: a session
+    is one video (.mkv) plus all .rnz lap files that reference it via
+    <videos><video><fileName> (the authoritative link - not just the
+    filename timestamp pattern)."""
+    groups: dict[str, list[Lap]] = {}
+    for rnz_path in sorted(dir_path.glob("*.rnz")):
+        try:
+            lap, _geometry = parse_rnz(rnz_path)
+        except Exception as exc:
             print(f"Warning: could not read {rnz_path.name}: {exc}", file=sys.stderr)
             continue
+        groups.setdefault(lap.video_file_name, []).append(lap)
 
-        root = ET.fromstring(xml_bytes)
-        lap_el = root.find("r:lap", NS)
-        lap_number = int(lap_el.find("r:lapNumber", NS).text)
-        start_time = parse_dt(lap_el.find("r:startTime", NS).text)
-        end_time = parse_dt(lap_el.find("r:endTime", NS).text)
-        is_start_crossed = lap_el.find("r:isStartLineCrossed", NS).text.strip() == "1"
-        is_end_crossed = lap_el.find("r:isEndLineCrossed", NS).text.strip() == "1"
+    sessions = []
+    for video_name, laps in groups.items():
+        laps.sort(key=lambda l: l.lap_number)
+        stem = Path(video_name).stem
+        video_path = dir_path / video_name
+        sessions.append({
+            "id": video_name,
+            "videoFileName": video_name,
+            "dateTime": laps[0].video_start_time.strftime(DATE_FMT)[:-3],
+            "lapCount": len(laps),
+            "laps": [
+                {
+                    "lapNumber": l.lap_number,
+                    "durationSeconds": round(l.duration_seconds, 3),
+                    "isFullLap": l.is_full_lap,
+                }
+                for l in laps
+            ],
+            "hasVideoFile": video_path.is_file(),
+            "hasCachedVideo": (DERIVED_DIR / f"{stem}.mp4").is_file(),
+        })
+    sessions.sort(key=lambda s: s["dateTime"])
+    return sessions
 
-        if track_candidate is None or (is_start_crossed and is_end_crossed and not track_candidate[0]):
-            geometry = parse_track_geometry(root)
-            if geometry is not None:
-                track_candidate = (is_start_crossed and is_end_crossed, geometry)
 
-        video_el = root.find("r:videos/r:video", NS)
-        video_file_name = video_el.find("r:fileName", NS).text
-        video_start_time = parse_dt(video_el.find("r:startTime", NS).text)
+def load_session(dir_path: Path, session_id: str) -> None:
+    """Load one session (identified by its video file name) from dir_path
+    into the global LAPS/TRACK state, and kick off video resolution
+    (cached mp4 / remux / raw mkv fallback). Raises LookupError if no .rnz
+    in dir_path references that video."""
+    matched: list[Lap] = []
+    geometries: list[tuple[bool, dict]] = []
+    for rnz_path in sorted(dir_path.glob("*.rnz")):
+        try:
+            lap, geometry = parse_rnz(rnz_path)
+        except Exception as exc:
+            print(f"Warning: could not read {rnz_path.name}: {exc}", file=sys.stderr)
+            continue
+        if lap.video_file_name != session_id:
+            continue
+        matched.append(lap)
+        if geometry is not None:
+            geometries.append((lap.is_full_lap, geometry))
 
-        sectors = []
-        # Sector times are only meaningful for complete laps (in-laps/out-laps
-        # tend to have empty or truncated sector start/end times).
-        if is_start_crossed and is_end_crossed:
-            lap_sectors_el = root.find("r:lapSectors", NS)
-            if lap_sectors_el is not None:
-                for sec_el in lap_sectors_el.findall("r:lapsector", NS):
-                    start_text = sec_el.find("r:startTime", NS).text
-                    end_text = sec_el.find("r:endTime", NS).text
-                    if not start_text or not end_text:
-                        continue
-                    sectors.append({
-                        "sectorNumber": int(sec_el.find("r:sectorNumber", NS).text),
-                        "startTime": parse_dt(start_text),
-                        "endTime": parse_dt(end_text),
-                    })
+    if not matched:
+        raise LookupError(f"No session '{session_id}' found in {dir_path}")
 
-        measurements_el = root.find("r:measurements", NS)
-        sm_elements = list(measurements_el.findall("r:sm", NS)) if measurements_el is not None else []
+    matched.sort(key=lambda l: l.lap_number)
+    incomplete = [l.lap_number for l in matched if not l.is_full_lap]
 
-        if not (is_start_crossed and is_end_crossed):
-            incomplete_lap_numbers.append(lap_number)
+    track_candidate = None
+    for is_full, geometry in geometries:
+        if track_candidate is None or (is_full and not track_candidate[0]):
+            track_candidate = (is_full, geometry)
 
-        parsed.append(Lap(
-            lap_number=lap_number,
-            start_time=start_time,
-            end_time=end_time,
-            is_start_crossed=is_start_crossed,
-            is_end_crossed=is_end_crossed,
-            video_file_name=video_file_name,
-            video_start_time=video_start_time,
-            sectors=sectors,
-            measurements_xml=sm_elements,
-        ))
+    with SESSION_LOCK:
+        min_lap_number_hint.clear()
+        if incomplete:
+            min_lap_number_hint["value"] = min(incomplete)
+        LAPS.clear()
+        for lap in matched:
+            LAPS[lap.lap_number] = lap
+        TRACK.clear()
+        if track_candidate is not None:
+            TRACK.update(track_candidate[1])
+        CURRENT["dir"] = str(dir_path)
+        CURRENT["sessionId"] = session_id
+        CURRENT["videoFileName"] = session_id
+        CURRENT["generation"] = CURRENT.get("generation", 0) + 1
 
-    if incomplete_lap_numbers:
-        min_lap_number_hint["value"] = min(incomplete_lap_numbers)
+    resolve_video(dir_path, session_id)
+    print(f"Loaded session '{session_id}' ({len(matched)} laps) from {dir_path}")
 
-    for lap in parsed:
-        LAPS[lap.lap_number] = lap
 
-    if track_candidate is not None:
-        TRACK.update(track_candidate[1])
+def find_ffmpeg() -> str | None:
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
 
-    print(f"Loaded {len(LAPS)} laps from {MEDIA_DIR}")
+
+def resolve_video(dir_path: Path, video_file_name: str) -> None:
+    """Decide how the session's video will be served: a cached remux in
+    derived/, a freshly-triggered background remux, or (no ffmpeg) the raw
+    .mkv served directly. Never touches dir_path (read-only media folder)."""
+    stem = Path(video_file_name).stem
+    mp4_path = DERIVED_DIR / f"{stem}.mp4"
+    mkv_path = dir_path / video_file_name
+    generation = CURRENT.get("generation", 0)
+    CURRENT["videoStem"] = stem
+
+    if mp4_path.is_file():
+        CURRENT.update(status="ready", videoUrl=f"/video/{stem}.mp4", percent=100.0, message=None)
+        return
+
+    if not mkv_path.is_file():
+        CURRENT.update(status="error", videoUrl=None, percent=None,
+                        message=f"Source video '{video_file_name}' not found in {dir_path}.")
+        return
+
+    ffmpeg_bin = find_ffmpeg()
+    if ffmpeg_bin:
+        DERIVED_DIR.mkdir(exist_ok=True)
+        CURRENT.update(status="remuxing", videoUrl=None, percent=0.0, message=None,
+                        srcSize=mkv_path.stat().st_size)
+        thread = threading.Thread(
+            target=run_remux, args=(ffmpeg_bin, mkv_path, mp4_path, generation), daemon=True
+        )
+        thread.start()
+    else:
+        CURRENT.update(
+            status="raw", videoUrl=f"/video/{video_file_name}", percent=None,
+            message=("ffmpeg was not found on this machine, so the original .mkv is served "
+                      "directly. Seeking and overall compatibility depend on your browser "
+                      "(Chrome usually plays H.264/AAC MKV; Firefox and Safari often don't)."),
+        )
+
+
+def run_remux(ffmpeg_bin: str, src: Path, dst: Path, generation: int) -> None:
+    """Lossless remux (stream copy) in a background thread: mkv -> faststart
+    mp4 in derived/. Writes to a .part file first and renames atomically so
+    the /video endpoint never serves a half-written file."""
+    part_path = dst.with_name(dst.name + ".part")
+    try:
+        subprocess.run(
+            [ffmpeg_bin, "-y", "-i", str(src), "-c", "copy", "-movflags", "+faststart",
+             "-f", "mp4", str(part_path)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
+        )
+        part_path.replace(dst)
+        if CURRENT.get("generation") == generation:
+            CURRENT.update(status="ready", videoUrl=f"/video/{dst.stem}.mp4", percent=100.0, message=None)
+    except Exception as exc:
+        try:
+            part_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        if CURRENT.get("generation") == generation:
+            CURRENT.update(status="error", videoUrl=None, percent=None, message=f"Remux failed: {exc}")
+
+
+def session_state_payload() -> dict:
+    status = CURRENT.get("status", "none")
+    percent = CURRENT.get("percent")
+    if status == "remuxing":
+        video_stem = CURRENT.get("videoStem")
+        src_size = CURRENT.get("srcSize") or 0
+        part_path = DERIVED_DIR / f"{video_stem}.mp4.part"
+        try:
+            if src_size and part_path.is_file():
+                percent = min(99.0, round(part_path.stat().st_size / src_size * 100, 1))
+        except OSError:
+            pass
+    return {
+        "active": CURRENT.get("sessionId") is not None,
+        "dir": CURRENT.get("dir"),
+        "sessionId": CURRENT.get("sessionId"),
+        "videoFileName": CURRENT.get("videoFileName"),
+        "videoUrl": CURRENT.get("videoUrl"),
+        "status": status,
+        "percent": percent,
+        "message": CURRENT.get("message"),
+    }
+
+
+def read_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(dir_path: Path) -> None:
+    try:
+        STATE_FILE.write_text(json.dumps({"lastFolder": str(dir_path)}), encoding="utf-8")
+    except OSError as exc:
+        print(f"Warning: could not write {STATE_FILE.name}: {exc}", file=sys.stderr)
+
+
+def get_roots() -> list[dict]:
+    """Convenience shortcuts for the folder picker: home, filesystem root,
+    and anything mounted under /mnt (WSL: USB sticks and Windows drives)."""
+    roots = [
+        {"label": "Home", "path": str(Path.home())},
+        {"label": "Filesystem root", "path": "/"},
+    ]
+    mnt = Path("/mnt")
+    if mnt.is_dir():
+        try:
+            children = sorted(mnt.iterdir(), key=lambda p: p.name.lower())
+        except OSError:
+            children = []
+        for child in children:
+            try:
+                if not child.is_dir() or not os.access(child, os.R_OK):
+                    continue
+            except OSError:
+                continue
+            if len(child.name) == 1 and child.name.isalpha():
+                label = f"Drive {child.name.upper()}: (Windows)"
+            else:
+                label = f"Mounted: {child.name}"
+            roots.append({"label": label, "path": str(child)})
+    return roots
+
+
+def list_subdirs(dir_path: Path) -> list[dict]:
+    out = []
+    for child in sorted(dir_path.iterdir(), key=lambda p: p.name.lower()):
+        if child.name.startswith("."):
+            continue
+        try:
+            if child.is_dir():
+                out.append({"name": child.name, "path": str(child)})
+        except OSError:
+            continue
+    return out
 
 
 def build_telemetry(lap: Lap) -> dict:
@@ -340,9 +570,21 @@ class Handler(BaseHTTPRequestHandler):
     def _send_error_json(self, status, message):
         self._send_json({"error": message}, status=status)
 
+    def _read_json_body(self) -> dict:
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            data = json.loads(raw.decode("utf-8"))
+            return data if isinstance(data, dict) else {}
+        except ValueError:
+            return {}
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
+        query = parse_qs(parsed.query)
 
         try:
             if path == "/api/laps":
@@ -351,9 +593,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self.handle_track()
             if path.startswith("/api/telemetry/"):
                 return self.handle_telemetry(path[len("/api/telemetry/"):])
+            if path == "/api/browse":
+                return self.handle_browse(query)
+            if path == "/api/sessions":
+                return self.handle_sessions(query)
+            if path == "/api/session":
+                dir_val = (query.get("dir") or [None])[0]
+                id_val = (query.get("id") or [None])[0]
+                return self.handle_select_session(dir_val, id_val)
+            if path in ("/api/session/status", "/api/session/current"):
+                return self._send_json(session_state_payload())
             if path.startswith("/video/"):
                 return self.handle_video(path[len("/video/"):])
             return self.handle_static(path)
+        except BrokenPipeError:
+            pass
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path)
+        try:
+            if path == "/api/session":
+                body = self._read_json_body()
+                return self.handle_select_session(body.get("dir"), body.get("id"))
+            return self._send_error_json(HTTPStatus.NOT_FOUND, "Not found")
         except BrokenPipeError:
             pass
 
@@ -376,13 +639,94 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_error_json(HTTPStatus.NOT_FOUND, "Lap not found")
         self._send_json(build_telemetry(lap))
 
+    def handle_browse(self, query: dict):
+        path_param = (query.get("path") or [None])[0]
+        target = path_param or read_state().get("lastFolder") or str(Path.home())
+        try:
+            resolved = Path(target).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            return self._send_error_json(HTTPStatus.NOT_FOUND, f"Path not found: {target}")
+        if not resolved.is_dir():
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, f"Not a directory: {resolved}")
+        try:
+            dirs = list_subdirs(resolved)
+        except PermissionError:
+            return self._send_error_json(HTTPStatus.FORBIDDEN, f"Permission denied: {resolved}")
+        try:
+            sessions = scan_sessions(resolved)
+        except PermissionError:
+            sessions = []
+        parent = str(resolved.parent) if resolved.parent != resolved else None
+        self._send_json({
+            "path": str(resolved),
+            "parent": parent,
+            "dirs": dirs,
+            "sessions": sessions,
+            "roots": get_roots(),
+        })
+
+    def handle_sessions(self, query: dict):
+        path_param = (query.get("path") or [None])[0]
+        if not path_param:
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, "Missing 'path' parameter")
+        try:
+            resolved = Path(path_param).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            return self._send_error_json(HTTPStatus.NOT_FOUND, f"Path not found: {path_param}")
+        if not resolved.is_dir():
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, f"Not a directory: {resolved}")
+        try:
+            sessions = scan_sessions(resolved)
+        except PermissionError:
+            return self._send_error_json(HTTPStatus.FORBIDDEN, f"Permission denied: {resolved}")
+        self._send_json({"path": str(resolved), "sessions": sessions})
+
+    def handle_select_session(self, dir_str: str | None, session_id: str | None):
+        if not dir_str or not session_id:
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, "Missing 'dir' or 'id'")
+        try:
+            resolved = Path(dir_str).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            return self._send_error_json(HTTPStatus.NOT_FOUND, f"Folder not found: {dir_str}")
+        if not resolved.is_dir():
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, f"Not a directory: {resolved}")
+        try:
+            load_session(resolved, session_id)
+        except LookupError as exc:
+            return self._send_error_json(HTTPStatus.NOT_FOUND, str(exc))
+        except PermissionError:
+            return self._send_error_json(HTTPStatus.FORBIDDEN, f"Permission denied: {resolved}")
+        except Exception as exc:
+            return self._send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, f"Failed to load session: {exc}")
+        save_state(resolved)
+        self._send_json(session_state_payload())
+
     def handle_video(self, name: str):
-        if "/" in name or "\\" in name:
+        if "/" in name or "\\" in name or name in ("", ".", ".."):
             return self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid file name")
-        file_path = DERIVED_DIR / name
+
+        if name.lower().endswith(".mp4"):
+            base_dir = DERIVED_DIR
+            content_type = "video/mp4"
+        elif name.lower().endswith(".mkv"):
+            video_dir_str = CURRENT.get("dir")
+            if not video_dir_str:
+                return self._send_error_json(HTTPStatus.NOT_FOUND, "No active session")
+            base_dir = Path(video_dir_str)
+            content_type = "video/x-matroska"
+        else:
+            return self._send_error_json(HTTPStatus.BAD_REQUEST, "Unsupported video type")
+
+        # The video must resolve inside derived/ or the active session's
+        # (read-only) media folder - never anywhere else.
+        file_path = (base_dir / name).resolve()
+        try:
+            file_path.relative_to(base_dir.resolve())
+        except ValueError:
+            return self._send_error_json(HTTPStatus.FORBIDDEN, "Forbidden")
         if not file_path.is_file():
             return self._send_error_json(HTTPStatus.NOT_FOUND, "Video not found")
-        self._serve_file_with_range(file_path, "video/mp4")
+        self._serve_file_with_range(file_path, content_type)
 
     def handle_static(self, path: str):
         if path == "/":
@@ -470,7 +814,20 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
-    load_laps()
+    # Backward compatibility: if ./media contains a session, auto-load it as
+    # the default so a fresh clone with media/ populated works exactly as
+    # before, with no folder picker interaction required.
+    try:
+        if MEDIA_DIR.is_dir():
+            sessions = scan_sessions(MEDIA_DIR)
+            if sessions:
+                load_session(MEDIA_DIR, sessions[0]["id"])
+            else:
+                print(f"No session found in {MEDIA_DIR} - use the folder picker in the UI.", file=sys.stderr)
+        else:
+            print(f"{MEDIA_DIR} does not exist - use the folder picker in the UI.", file=sys.stderr)
+    except Exception as exc:
+        print(f"Warning: could not auto-load default session: {exc}", file=sys.stderr)
 
     server = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
     print(f"Server running at http://localhost:{args.port}")

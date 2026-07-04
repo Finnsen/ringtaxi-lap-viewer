@@ -12,7 +12,13 @@ __pycache__/
 # Local Claude Code settings (machine-specific)
 .claude/settings.local.json*
 
+# Remembers the last media folder used by the folder picker (machine-specific)
+.rnv-state.json
+
 # Misc
 *.log
 .DS_Store
 Thumbs.db
+
+# Windows download metadata (appears when copying files into WSL)
+*:Zone.Identifier

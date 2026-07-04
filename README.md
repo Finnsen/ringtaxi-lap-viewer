@@ -6,7 +6,9 @@ RaceNavigator logs.
 
 ## Getting started
 
-Requires only the Python 3.12 standard library — no `pip install` needed.
+Requires only the Python 3.12 standard library — no `pip install` needed
+(an optional `imageio-ffmpeg` package is used as an automatic fallback if
+`ffmpeg` isn't installed — see "Automatic video preparation" below).
 
 ```bash
 python3 server.py            # starts on http://localhost:8000
@@ -22,20 +24,35 @@ Open <http://localhost:8000> in your browser. Video and telemetry are served
 locally; nothing is fetched from the internet and no CDN dependencies are
 used.
 
-Files the server reads from (read-only, never written to):
+If `./media` contains a recording, it's loaded automatically on startup, same
+as before. Otherwise (or to switch to a different recording) a folder-picker
+modal lets you browse the filesystem — including USB sticks and other
+attached disks — and pick a folder to load a session from. The folder you
+pick is never written to; it's treated as strictly read-only (it might be a
+USB stick). See "Folder picker and sessions" below.
 
-- `media/*.rnz` — lap data (zipped XML), read and parsed in memory at startup.
-- `derived/20260703_095104957_RNONE-1126.mp4` — a finished, remuxed browser-
-  friendly video (H.264 High 1280×720@30 + AAC-LC, faststart) served with
-  full HTTP Range support so the browser can seek freely within the clip.
+Files/folders the server may read from (all read-only, never written to):
 
-### First-time setup: generate the video in `derived/`
+- `media/*.rnz` or `<your folder>/*.rnz` — lap data (zipped XML), parsed in
+  memory when a session is loaded.
+- `media/*.mkv` or `<your folder>/*.mkv` — the original camera recording,
+  used as the remux source (and, without `ffmpeg`, played directly).
 
-`media/` and `derived/` are excluded from Git (large files / personal
-recordings), so after a fresh clone you'll need to copy the original files
-from the USB stick into `media/` and remux the mkv file into a browser-
-friendly MP4 yourself. This is a lossless repackaging (no re-encoding, takes
-seconds):
+The only things this server writes to are `derived/` (its own remux cache)
+and `.rnv-state.json` in the project directory (remembers the last folder
+used, for the folder picker — excluded from Git).
+
+### First-time setup
+
+After a fresh clone, `media/` and `derived/` don't exist yet (both are
+excluded from Git — large files / personal recordings). Copy the original
+files from your camera/USB stick into `media/` (or point the folder picker
+at wherever they already live — no copying required in that case) and start
+the server; see "Automatic video preparation" for how the browser-friendly
+video gets created.
+
+If you'd rather do it by hand, this is a lossless repackaging (stream copy,
+no re-encoding, takes seconds):
 
 ```bash
 mkdir -p derived
@@ -54,6 +71,42 @@ python3 -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"
 and use the path it prints instead of `ffmpeg` in the command above.
 (Warnings about "Non-monotonic DTS" on the audio track are harmless — ~0.5 ms
 jitter from the GStreamer muxer in the recording hardware.)
+
+### Folder picker and sessions
+
+A folder can contain more than one recording. The server groups the `.mkv` +
+`.rnz` files in a folder into **sessions** by following the authoritative
+link inside each `.rnz` file's XML (`<videos><video><fileName>`) — not just
+the timestamp in the filename. If a folder has several sessions, the folder
+picker lists all of them (video file name, date/time, lap count) so you can
+choose which one to load.
+
+The picker shows convenient shortcuts (home folder, filesystem root, and any
+mounted disks — on WSL2, USB sticks and Windows drives usually appear under
+`/mnt/*`), plus normal folder navigation with breadcrumbs. The last folder
+you used is remembered in `.rnv-state.json` (in the project directory,
+machine-specific, excluded from Git) and preselected the next time you open
+the picker. Click "Change folder" in the header at any time to switch to a
+different recording.
+
+### Automatic video preparation
+
+When you select a session, the server looks for a browser-friendly video in
+this order:
+
+1. **A cached remux** in `derived/<video-name>.mp4` — used immediately if
+   present (this is what makes the bundled `media/` example start instantly).
+2. **An automatic remux**, if `ffmpeg` is available (found via `PATH`, or via
+   the `imageio-ffmpeg` package as a fallback): the server transcodes the
+   `.mkv` into `derived/<video-name>.mp4` in a background thread (lossless
+   stream copy, `-c copy -movflags +faststart`, no quality loss, no
+   re-encoding). The UI shows a "Preparing video…" progress indicator while
+   this runs; once done, the mp4 is cached in `derived/` so future loads of
+   the same session are instant.
+3. **The raw `.mkv`, served directly**, if no `ffmpeg` is available anywhere.
+   A notice in the UI explains that playback and seeking then depend on your
+   browser (Chrome usually plays H.264/AAC MKV directly; Firefox and Safari
+   often don't).
 
 ## File formats (short version)
 
@@ -150,11 +203,38 @@ roughly −1.1…+0.5 g).
   each with `kind`, `label` and 3 reference points) and `curves` (83 named
   Nürburgring corners, each with `description` and 8 reference points
   tracing the corner).
-- `GET /video/<name>.mp4` — video from `derived/`, with full Range support
-  (206/Content-Range/Accept-Ranges) for browser seeking.
+- `GET /api/browse?path=<dir>` — folder-picker listing: resolved `path`,
+  `parent`, `dirs` (subdirectory names, hidden/unreadable ones skipped),
+  `sessions` (same shape as `/api/sessions` below, for this folder), and
+  `roots` (shortcut folders: home, filesystem root, mounted disks under
+  `/mnt/*`). `path` defaults to the last-used folder (or the home folder) if
+  omitted. Returns a JSON `error` with a 4xx status for a nonexistent path,
+  a path that isn't a directory, or a permission error.
+- `GET /api/sessions?path=<dir>` — sessions found directly in `<dir>`: each
+  has `id`, `videoFileName`, `dateTime`, `lapCount`, `laps` (lap
+  number/duration/isFullLap), `hasVideoFile` and `hasCachedVideo`.
+- `POST /api/session` (JSON body `{"dir": ..., "id": ...}`, or `GET
+  /api/session?dir=...&id=...`) — loads that session's laps/track into the
+  server, resolves/starts preparing its video, and returns the same payload
+  as `/api/session/status`.
+- `GET /api/session/status` (alias: `/api/session/current`) — the active
+  session's state: `active`, `dir`, `sessionId`, `videoFileName`,
+  `videoUrl`, `status` (`none` | `ready` | `remuxing` | `raw` | `error`),
+  `percent` (remux progress, if derivable) and `message`.
+- `GET /video/<name>` — the active session's video: `<name>.mp4` is served
+  from `derived/`, `<name>.mkv` is served from the active session's own
+  folder (raw fallback with no `ffmpeg`) — resolved and checked to stay
+  within one of those two folders. Full Range support (206/Content-Range/
+  Accept-Ranges) for browser seeking either way.
 - `GET /` — static UI (`static/`).
 
 ## User interface
+
+On first load with no active session, a folder-picker modal opens
+automatically (see "Folder picker and sessions" above); a "Change folder"
+button in the header reopens it at any time. While a video is being prepared
+(automatic remux) or a fallback notice applies (no `ffmpeg`, raw `.mkv`
+playback), an overlay on the video pane communicates the current state.
 
 Video on the left, lap list on the right (click a lap to jump to the
 corresponding point in the video and start playback — the active lap is
