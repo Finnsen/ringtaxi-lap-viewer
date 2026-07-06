@@ -20,9 +20,13 @@ python3 server.py --port 8765
 > service on the Windows side. Start the server on a different port, e.g.
 > `--port 8765`.
 
-Open <http://localhost:8000> in your browser. Video and telemetry are served
-locally; nothing is fetched from the internet and no CDN dependencies are
-used.
+Open <http://localhost:8000> in your browser. Video, telemetry and the UI
+(including [Leaflet](https://leafletjs.com/), vendored locally — see "Real
+map background" below) are served locally with no CDN dependencies; the app
+is fully functional with no internet connection. The only optional
+network requests are the OpenStreetMap/satellite map tiles, and only if you
+explicitly switch the GPS map's layer to "Map" or "Satellite" — the default
+"None" layer never leaves your machine.
 
 If `./media` contains a recording, it's loaded automatically on startup, same
 as before. Otherwise (or to switch to a different recording) a folder-picker
@@ -254,10 +258,73 @@ roughly 60 m of the corner; otherwise a muted dash is shown.
 
 ### Click-to-seek on the GPS map
 
-Click (or drag) anywhere on the GPS track to jump to that point in the
-video: the nearest telemetry point within a reasonable hit distance is
-looked up, and the video seeks to that point's timestamp. While hovering
-over the track, a faint ring marker is shown at the nearest point.
+Click (or drag) anywhere near the GPS track to jump to that point in the
+video: the nearest telemetry point within a fixed pixel hit-radius is
+looked up (converted through the map's current zoom/pan via
+`latLngToContainerPoint`, so it works the same at any zoom level), and the
+video seeks to that point's timestamp. A hit disables map panning for the
+duration of the drag so it seeks instead of panning the map; clicking or
+dragging elsewhere on the map behaves like a normal map (pan/zoom). While
+hovering over the track, a faint ring marker is shown at the nearest point.
+
+### Real map background (optional, OpenStreetMap / satellite)
+
+The GPS map is a [Leaflet](https://leafletjs.com/) map (vendored locally in
+`static/vendor/leaflet/` — no CDN, so the app keeps working fully offline).
+A small layer control in the top-right corner of the map switches between:
+
+- **None** (default) — no tiles, just the dark background with the track
+  polyline, start/finish/sector lines and markers. Makes no network
+  requests at all — this is what you get with no internet connection.
+- **Map** — standard OpenStreetMap tiles, dimmed/desaturated with a CSS
+  filter so the light tiles don't clash with the dark cockpit UI.
+- **Satellite** — Esri World Imagery aerial tiles.
+
+Both online layers are fetched on demand only when selected, require
+attribution (shown unobtrusively in the map's bottom-right corner, hidden
+for "None"), and are used only for orientation — track lines, corner
+names, click-to-seek and the position marker are all computed from the
+session's own GPS telemetry and `/api/track` geometry, independent of
+whether a base map is loaded. If tiles fail to load (offline), Leaflet just
+leaves them blank; the dark background and every overlay stay fully
+functional. The chosen layer is remembered in `localStorage`.
+
+Zoom is constrained to the track: after a session loads, the map fits the
+whole track (from the active lap's telemetry plus the track's start/finish/
+sector line points) with a little padding, then that padded area becomes
+both the minimum zoom level and the pan boundary (`maxBounds`) — so you can
+zoom in to inspect a corner, but can't zoom or pan out past the full track.
+This is derived purely from the loaded session's coordinates, so it works
+the same at any track, not just Nürburgring.
+
+### Camera modes (free / follow / heading-up)
+
+A second button group under the base-layer toggle switches between three
+camera behaviors:
+
+- **Free** (default) — the behavior above: fit to the whole track, pan/zoom
+  manually, clamped to the track's bounds.
+- **Follow** — the map recenters on the car every frame during playback
+  (north stays up), at an adjustable zoom (defaults a few levels in from the
+  track-fit zoom). Manual panning is disabled — dragging the map won't fight
+  the camera — but you can still zoom with the scroll wheel/pinch, and the
+  camera re-centers on the car immediately after. The track's `maxBounds`
+  clamp is relaxed in this mode (it would otherwise fight centering near the
+  edge of the track at high zoom) but the minimum zoom stays the same.
+- **Nav** (heading-up) — like Follow, but the map also rotates so the car's
+  current direction of travel always points up, car-navigation style. This
+  uses the [leaflet-rotate](https://github.com/Raruto/leaflet-rotate) plugin
+  (vendored locally, version **0.2.8**, in
+  `static/vendor/leaflet-rotate/leaflet-rotate.js` — no CDN, loaded after
+  `leaflet.js` and before `app.js`). If the plugin fails to load for any
+  reason, the "Nav" option is hidden automatically and the app falls back to
+  Free/Follow (north-up) only — nothing else breaks.
+
+The selected mode is remembered in `localStorage`, alongside the base-layer
+choice. Switching from Follow/Nav back to Free resets the map's rotation and
+refits the whole track; switching from Free into a follow mode jumps
+straight to the follow zoom on the car's current position. Clicking/dragging
+the track to seek still works in every mode.
 
 ### Chart panel
 
@@ -278,4 +345,8 @@ playback (throttle up, brake down; the display is clipped at ±2 g), plus
 numeric readouts for both channels. The data is smoothed server-side (see
 the section on `la`/`lo`) so curb spikes don't make the ball jump around.
 
-No frameworks or CDNs are used — everything runs offline from `static/`.
+No CDNs are used — the only third-party code is Leaflet (for the optional
+map backgrounds) and its leaflet-rotate plugin (for heading-up follow mode),
+both vendored locally under `static/vendor/`; the rest of the UI (charts,
+HUD, G-ball, folder picker) is plain HTML/CSS/JS. The app runs fully offline
+from `static/`, with map tiles as the sole optional online extra.

@@ -17,14 +17,21 @@ const state = {
   activeLapNumber: null,
   track: null,                 // {lines, curves}
   units: "kmh",                // 'kmh' | 'mph'
-  mapStyle: "satellite",       // 'satellite' | 'schematic'
+  mapStyle: "none",            // 'none' | 'map' | 'satellite' (Leaflet base layer)
   hoverT: null,
   mapHover: null,
   lastSample: null,
   rafId: null,
-  mapProj: null,
+  mapCosLat: null,             // avg cos(lat) of the active lap, for corner-distance calcs
   mapDrawnFor: null,
   chartsBuiltFor: null,
+  pendingBoundsPoints: null,
+  cameraMode: "free",          // 'free' | 'follow-north' | 'follow-heading'
+  rotateAvailable: false,      // true once leaflet-rotate has patched L.Map with setBearing
+  trackMinZoom: null,          // the zoom that fits the whole track (also the floor for all modes)
+  trackPaddedBounds: null,     // padded L.LatLngBounds of the track, reused when returning to Free
+  followZoom: null,            // user-adjustable zoom used while in either Follow mode
+  currentBearingDeg: 0,        // map bearing applied this frame (0 outside follow-heading)
 };
 
 /* ---- DOM ---- */
@@ -34,7 +41,6 @@ const pillsEl = $("lap-pills");
 const hud = { speed: $("hud-speed"), unit: $("hud-speed-unit"), corner: $("hud-corner"), timecode: $("hud-timecode"), rec: $("rec-dot"), brake: $("hud-brake"), throttle: $("hud-throttle") };
 const altValueEl = $("alt-value"), latgEl = $("latg-value"), longEl = $("long-value");
 const mapCornerEl = $("map-corner");
-const canvas = $("track-canvas"), ctx = canvas.getContext("2d");
 const gballCanvas = $("gball-canvas"), gctx = gballCanvas.getContext("2d");
 
 /* ---- formatting ---- */
@@ -109,18 +115,109 @@ $("units-toggle").addEventListener("click", () => {
 
 function buildMapToggle() {
   const host = $("map-toggle"); host.innerHTML = "";
-  [["satellite", "Sat"], ["schematic", "Map"]].forEach(([v, lbl]) => {
+  [["none", "None"], ["map", "Map"], ["satellite", "Sat"]].forEach(([v, lbl]) => {
     const b = document.createElement("button");
     b.textContent = lbl; b.dataset.v = v;
-    b.classList.toggle("is-active", state.mapStyle === v);
-    b.addEventListener("click", () => {
-      state.mapStyle = v;
-      for (const c of host.children) c.classList.toggle("is-active", c.dataset.v === v);
-      if (state.activeLapNumber != null) drawStaticTrack(state.telemetryCache.get(state.activeLapNumber));
-      redrawTrack(state.lastSample);
-    });
+    b.addEventListener("click", () => applyMapStyle(v));
     host.appendChild(b);
   });
+  updateMapToggleButtons();
+}
+function updateMapToggleButtons() {
+  const host = $("map-toggle");
+  for (const c of host.children) c.classList.toggle("is-active", c.dataset.v === state.mapStyle);
+}
+
+/* Camera-mode control - a second, visually distinct button group (own
+ * rounded pill, placed under the base-layer toggle) so the two independent
+ * choices (base layer vs. camera behavior) don't look like one control. */
+function buildCameraToggle() {
+  const host = $("camera-toggle"); host.innerHTML = "";
+  const opts = [
+    ["free", "Free", "Free — pan/zoom manually, fitted to the whole track"],
+    ["follow-north", "Follow", "Follow — camera tracks the car, north stays up"],
+  ];
+  if (state.rotateAvailable) opts.push(["follow-heading", "Nav", "Follow — camera tracks the car, heading stays up (car-nav style)"]);
+  opts.forEach(([v, lbl, title]) => {
+    const b = document.createElement("button");
+    b.textContent = lbl; b.dataset.v = v; b.title = title;
+    b.addEventListener("click", () => applyCameraMode(v));
+    host.appendChild(b);
+  });
+  updateCameraToggleButtons();
+}
+function updateCameraToggleButtons() {
+  const host = $("camera-toggle");
+  for (const c of host.children) c.classList.toggle("is-active", c.dataset.v === state.cameraMode);
+}
+function clampFollowZoom(z) {
+  const lo = state.trackMinZoom != null ? state.trackMinZoom : 0;
+  return clamp(z, lo, 19);
+}
+
+/* Switches camera behavior. Free = current manual pan/zoom clamped to the
+ * track bounds (unchanged behavior). Follow modes recenter on the car every
+ * frame (see updateCamera, driven by the rAF loop) and disable manual
+ * dragging entirely so a stray drag can't fight the camera; maxBounds is
+ * relaxed in follow modes since centering near the track edge at high zoom
+ * would otherwise fight the bounds clamp (minZoom stays the track-fit zoom
+ * in all modes). Switching *into* a follow mode jumps straight to the
+ * follow-zoom; switching *back to* Free resets bearing and refits the track
+ * (this refit only happens on the mode switch, not every frame). */
+function applyCameraMode(mode) {
+  if (mode === "follow-heading" && !state.rotateAvailable) mode = "follow-north"; // degrade gracefully
+  state.cameraMode = mode;
+  try { localStorage.setItem("rnv-camera-mode", mode); } catch (err) { /* not persisted, still works */ }
+  updateCameraToggleButtons();
+  if (!state.map) return;
+
+  if (mode === "free") {
+    state.map.dragging.enable();
+    if (state.rotateAvailable) state.map.setBearing(0);
+    state.currentBearingDeg = 0;
+    if (state.trackMinZoom != null) state.map.setMinZoom(state.trackMinZoom);
+    state.map.setMaxBounds(state.trackPaddedBounds || null);
+    if (state.trackPaddedBounds) state.map.fitBounds(state.trackPaddedBounds, { animate: false });
+    return;
+  }
+
+  // follow-north / follow-heading
+  state.map.dragging.disable();
+  state.map.setMaxBounds(null);
+  if (state.trackMinZoom != null) state.map.setMinZoom(state.trackMinZoom);
+  if (mode === "follow-north" && state.rotateAvailable) state.map.setBearing(0);
+  if (mode === "follow-north") state.currentBearingDeg = 0;
+  const zoom = clampFollowZoom(state.followZoom != null ? state.followZoom : (state.trackMinZoom || 0) + 3);
+  state.followZoom = zoom;
+  const pos = state.lastSample;
+  if (pos) state.map.setView([pos.lat, pos.lon], zoom, { animate: false });
+  else state.map.setZoom(zoom);
+}
+
+/* Recenter (and re-derive the marker bearing, for heading-up) on the car's
+ * interpolated position - called once per frame from updateDisplay via the
+ * rAF loop, and again from updateDisplay on 'seeked'/'timeupdate' events so
+ * a paused, scrubbed camera still lands on the right spot. No-op in Free. */
+function updateCamera(dot) {
+  if (!state.map) return;
+  if (state.cameraMode !== "follow-north" && state.cameraMode !== "follow-heading") return;
+  if (!dot) return;
+  if (state.cameraMode === "follow-heading" && state.rotateAvailable) {
+    // Sign convention: L.Map#setBearing(deg) rotates the map's content
+    // clockwise by `deg` (it feeds straight into a CSS `rotate(deg)` on the
+    // rotate pane - see leaflet-rotate's L.DomUtil.setTransform override).
+    // To make the car's direction of travel point "up" (car-nav style), the
+    // whole map must be rotated by the *negative* of the compass heading:
+    // a feature at screen-angle `heading` clockwise-from-up needs to land at
+    // 0 (straight up), and rotating the content clockwise by `bearing` moves
+    // it to `heading + bearing`, so `bearing = -heading`.
+    state.map.setBearing(-dot.heading);
+    state.currentBearingDeg = -dot.heading;
+  } else {
+    state.currentBearingDeg = 0;
+  }
+  // animate:false - this runs every frame, so any easing would fight itself.
+  state.map.setView([dot.lat, dot.lon], state.map.getZoom(), { animate: false });
 }
 
 function buildRates() {
@@ -177,103 +274,262 @@ function interpolate(tel, t) {
 }
 function sampleAt(tel, i) { return { speedKmh: tel.speedKmh[i], lat: tel.lat[i], lon: tel.lon[i], alt: tel.alt[i], latG: tel.latG[i], lonG: tel.lonG[i], vertG: tel.vertG[i], heading: tel.heading[i] }; }
 
-/* ================= map / GPS track ================= */
-const MAP_PAD = 34;
-function projectPoints(tel) {
-  const lats = tel.lat, lons = tel.lon; if (!lats.length) return null;
-  const avgLat = lats.reduce((a, b) => a + b, 0) / lats.length;
-  const cosLat = Math.cos(avgLat * Math.PI / 180);
-  const xs = lons.map((l) => l * cosLat), ys = lats.map((l) => -l);
-  const minX = Math.min.apply(null, xs), maxX = Math.max.apply(null, xs), minY = Math.min.apply(null, ys), maxY = Math.max.apply(null, ys);
-  return { cosLat, minX, minY, spanX: Math.max(maxX - minX, 1e-9), spanY: Math.max(maxY - minY, 1e-9) };
-}
-function toXY(pr, lat, lon, W, H, pad) {
-  const x = lon * pr.cosLat, y = -lat, uw = W - pad * 2, uh = H - pad * 2;
-  const s = Math.min(uw / pr.spanX, uh / pr.spanY);
-  const ox = pad + (uw - pr.spanX * s) / 2, oy = pad + (uh - pr.spanY * s) / 2;
-  return { x: ox + (x - pr.minX) * s, y: oy + (y - pr.minY) * s };
-}
-function mulberry32(a) { return function () { a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+/* ================= map / GPS track (Leaflet) =================
+ * A real Leaflet map replaces the old hand-rolled canvas projection. Three
+ * base layers are available ("None" = dark background only, fully offline;
+ * "Map" = OpenStreetMap; "Satellite" = Esri World Imagery), all vendored
+ * locally except the tile *images* themselves, which are fetched online only
+ * when a tile layer is selected - "None" never makes a network request and
+ * all overlays (track, lines, markers) keep working with no connectivity. */
+const TRACK_COLOR = "#8fffb0";
+const HOVER_COLOR = "#e8ebee";
 
-function drawStaticTrack(tel) {
-  if (!tel || !state.cssW) return;
-  const W = state.cssW, H = state.cssH, dpr = state.dpr;
-  const pr = projectPoints(tel); state.mapProj = pr; state.mapDrawnFor = tel.lapNumber;
-  const off = document.createElement("canvas"); off.width = canvas.width; off.height = canvas.height;
-  const c = off.getContext("2d"); c.scale(dpr, dpr);
-  const pts = tel.lat.map((_, i) => toXY(pr, tel.lat[i], tel.lon[i], W, H, MAP_PAD));
-
-  if (state.mapStyle === "satellite") {
-    c.fillStyle = "#141c16"; c.fillRect(0, 0, W, H);
-    const rnd = mulberry32(91);
-    for (let k = 0; k < 120; k++) { const x = rnd() * W, y = rnd() * H, r = 8 + rnd() * 46, g = Math.floor(30 + rnd() * 36); c.fillStyle = "rgba(" + (g - 8) + "," + (g + 14) + "," + (g - 6) + ",.5)"; c.beginPath(); c.arc(x, y, r, 0, 7); c.fill(); }
-    for (let k = 0; k < 200; k++) { const x = rnd() * W, y = rnd() * H; c.fillStyle = "rgba(18,32,20,.6)"; c.beginPath(); c.arc(x, y, 1.4 + rnd() * 2.2, 0, 7); c.fill(); }
-    c.strokeStyle = "rgba(120,120,112,.28)"; c.lineWidth = 3; c.beginPath(); c.moveTo(0, H * 0.72); c.bezierCurveTo(W * 0.3, H * 0.5, W * 0.6, H * 0.9, W, H * 0.62); c.stroke();
-    c.lineWidth = 2; c.beginPath(); c.moveTo(W * 0.15, 0); c.bezierCurveTo(W * 0.35, H * 0.4, W * 0.1, H * 0.7, W * 0.4, H); c.stroke();
-    c.fillStyle = "rgba(0,0,0,.16)"; c.fillRect(0, 0, W, H);
-    const corridor = 12; c.lineJoin = "round"; c.lineCap = "round";
-    c.strokeStyle = "#0c0e0d"; c.lineWidth = corridor + 4; strokePath(c, pts);
-    c.strokeStyle = "#43474d"; c.lineWidth = corridor; strokePath(c, pts);
-    c.strokeStyle = "#5a5f66"; c.lineWidth = corridor * 0.5; strokePath(c, pts);
-    c.strokeStyle = "#8fffb0"; c.globalAlpha = 0.9; c.lineWidth = 2; strokePath(c, pts); c.globalAlpha = 1;
-  } else {
-    c.fillStyle = "#0d1013"; c.fillRect(0, 0, W, H);
-    c.strokeStyle = "#1a1f25"; c.lineWidth = 1;
-    for (let gx = 0; gx < W; gx += 40) { c.beginPath(); c.moveTo(gx + 0.5, 0); c.lineTo(gx + 0.5, H); c.stroke(); }
-    for (let gy = 0; gy < H; gy += 40) { c.beginPath(); c.moveTo(0, gy + 0.5); c.lineTo(W, gy + 0.5); c.stroke(); }
-    c.lineJoin = "round"; c.lineCap = "round"; c.strokeStyle = "#8fffb0"; c.globalAlpha = 0.85; c.lineWidth = 2.5; strokePath(c, pts); c.globalAlpha = 1;
+function tileLayerFor(style) {
+  if (style === "map") {
+    return L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors',
+    });
   }
-  drawTrackLines(c, pr, W, H);
-  state.mapStatic = off;
+  if (style === "satellite") {
+    return L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {
+      maxZoom: 19,
+      attribution: "Tiles &copy; Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+    });
+  }
+  return null; // "none" - no network tiles, just the dark background + overlays
 }
-function strokePath(c, pts) { c.beginPath(); pts.forEach((p, i) => { i ? c.lineTo(p.x, p.y) : c.moveTo(p.x, p.y); }); c.stroke(); }
 
-function drawTrackLines(c, pr, W, H) {
+function applyMapStyle(style) {
+  state.mapStyle = style;
+  try { localStorage.setItem("rnv-map-style", style); } catch (err) { /* storage unavailable - not persisted, still works */ }
+  if (state.activeTileLayer) { state.map.removeLayer(state.activeTileLayer); state.activeTileLayer = null; }
+  const container = state.map.getContainer();
+  container.classList.remove("basemap-none", "basemap-map", "basemap-satellite");
+  container.classList.add("basemap-" + style);
+  const layer = tileLayerFor(style);
+  state.attributionControl.remove();
+  if (layer) {
+    // If tiles fail (offline), Leaflet just leaves them blank - the dark
+    // container background and all overlays remain fully visible/functional.
+    layer.on("tileerror", () => {});
+    layer.addTo(state.map);
+    state.activeTileLayer = layer;
+    state.attributionControl.addTo(state.map);
+  }
+  updateMapToggleButtons();
+}
+
+/* Called once per session load (not per lap) once both the reference lap's
+ * telemetry and the track geometry are available: fits the whole track with
+ * a little padding, then clamps min zoom / pan bounds to that same padded
+ * box so the user can zoom into a corner but never zoom or pan out past the
+ * full track - fully derived from data, nothing track-specific. */
+function setupMapBounds(points) {
+  if (!state.map || !points.length) return;
+  const padded = L.latLngBounds(points).pad(0.12);
+  state.map.setMaxBounds(null);
+  state.map.setMinZoom(0);
+  const zoom = state.map.getBoundsZoom(padded, false);
+  state.map.options.maxBoundsViscosity = 1.0;
+  state.map.setMinZoom(zoom);
+  state.map.setMaxZoom(19);
+  state.trackMinZoom = zoom;
+  state.trackPaddedBounds = padded;
+  if (state.followZoom == null) state.followZoom = clampFollowZoom(zoom + 3);
+  // Applies whichever camera mode is currently selected (Free: fits+clamps
+  // to `padded` as before; Follow: jumps to the follow-zoom on the car).
+  applyCameraMode(state.cameraMode);
+}
+function collectBoundsPoints(tel) {
+  const pts = tel.lat.map((la, i) => [la, tel.lon[i]]);
+  if (state.track) for (const line of state.track.lines) for (const p of line.points) pts.push([p.lat, p.lon]);
+  return pts;
+}
+
+/* Start/finish/sector lines + labels - independent of which lap is showing,
+ * redrawn once whenever /api/track resolves. */
+function drawTrackLines() {
+  if (!state.map || !state.trackLinesLayer) return;
+  state.trackLinesLayer.clearLayers();
   if (!state.track) return;
   for (const line of state.track.lines) {
-    const pts = line.points.map((p) => toXY(pr, p.lat, p.lon, W, H, MAP_PAD));
-    if (pts.length < 2) continue;
+    const latlngs = line.points.map((p) => [p.lat, p.lon]);
+    if (latlngs.length < 2) continue;
     const isSector = line.kind === "sector";
-    c.strokeStyle = isSector ? "#7f8994" : ACCENT; c.globalAlpha = isSector ? 0.6 : 0.95; c.lineWidth = isSector ? 1.8 : 2.5;
-    strokePath(c, pts); c.globalAlpha = 1;
-    const mid = pts[Math.floor(pts.length / 2)];
-    c.fillStyle = isSector ? AXIS_TEXT : ACCENT; c.font = "700 10px ui-monospace, monospace"; c.textAlign = "center"; c.textBaseline = "middle";
-    c.fillText(line.label, mid.x, mid.y - 9);
+    L.polyline(latlngs, {
+      renderer: state.trackRenderer,
+      color: isSector ? "#7f8994" : ACCENT,
+      weight: isSector ? 2 : 3,
+      opacity: isSector ? 0.6 : 0.95,
+      interactive: false,
+    }).addTo(state.trackLinesLayer);
+    const mid = latlngs[Math.floor(latlngs.length / 2)];
+    const icon = L.divIcon({
+      className: "track-line-label" + (isSector ? " is-sector" : ""),
+      html: line.label,
+      iconSize: [26, 14],
+      iconAnchor: [13, 22],
+    });
+    L.marker(mid, { icon, interactive: false, keyboard: false }).addTo(state.trackLinesLayer);
   }
 }
 
-function drawHeadingArrow(c, x, y, headingDeg) {
-  c.save(); c.translate(x, y); c.rotate(headingDeg * Math.PI / 180);
-  c.fillStyle = ACCENT; c.shadowColor = ACCENT; c.shadowBlur = 12;
-  c.beginPath(); c.moveTo(0, -8); c.lineTo(5.5, 6); c.lineTo(-5.5, 6); c.closePath(); c.fill(); c.shadowBlur = 0; c.restore();
+/* The lap's own GPS polyline - redrawn whenever the active lap changes. */
+function drawStaticTrack(tel) {
+  if (!tel || !state.map) return;
+  state.mapDrawnFor = tel.lapNumber;
+  const latlngs = tel.lat.map((la, i) => [la, tel.lon[i]]);
+  if (state.trackPolyline) state.trackLayer.removeLayer(state.trackPolyline);
+  state.trackPolyline = L.polyline(latlngs, {
+    renderer: state.trackRenderer,
+    color: TRACK_COLOR,
+    weight: 3,
+    opacity: 0.9,
+    lineJoin: "round",
+    lineCap: "round",
+    interactive: false,
+  }).addTo(state.trackLayer);
+  const avgLat = tel.lat.reduce((a, b) => a + b, 0) / tel.lat.length;
+  state.mapCosLat = Math.cos(avgLat * Math.PI / 180);
 }
 
-function redrawTrack(dot) {
-  if (!state.mapStatic) return;
-  const W = state.cssW, H = state.cssH, dpr = state.dpr, pr = state.mapProj;
+/* Heading-rotated position marker, updated every frame from the rAF loop. */
+function updatePositionMarker(dot) {
   state.lastSample = dot;
-  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, canvas.width, canvas.height); ctx.drawImage(state.mapStatic, 0, 0);
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  if (state.mapHover) { ctx.strokeStyle = "#e8ebee"; ctx.globalAlpha = 0.6; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(state.mapHover.x, state.mapHover.y, 7, 0, 7); ctx.stroke(); ctx.globalAlpha = 1; }
-  if (dot) { const p = toXY(pr, dot.lat, dot.lon, W, H, MAP_PAD); drawHeadingArrow(ctx, p.x, p.y, dot.heading != null ? dot.heading : 0); }
+  if (!state.map || !state.positionMarker) return;
+  if (!dot) { state.map.removeLayer(state.positionMarker); return; }
+  if (!state.map.hasLayer(state.positionMarker)) state.positionMarker.addTo(state.trackLayer);
+  state.positionMarker.setLatLng([dot.lat, dot.lon]);
+  const el = state.positionMarker.getElement();
+  const arrow = el && el.querySelector(".track-pos-arrow");
+  // The marker lives in Leaflet's markerPane, which leaflet-rotate keeps
+  // screen-aligned (unrotated) by design - only the underlying lat/lng ->
+  // screen-point math accounts for map bearing, not the icon's own CSS
+  // rotation. So the arrow's on-screen rotation has to add the current map
+  // bearing back in by hand: screen rotation = heading + bearing. In
+  // follow-heading mode bearing = -heading (see updateCamera), so this
+  // always cancels to 0 - the triangle points straight up, as expected for
+  // car-nav. In Free/follow-north, bearing is always 0, so this reduces to
+  // the heading, unchanged from before this feature.
+  if (arrow) arrow.style.transform = "rotate(" + ((dot.heading != null ? dot.heading : 0) + (state.currentBearingDeg || 0)) + "deg)";
 }
 
-/* click / drag to seek on the map */
-function mapXY(ev) { const r = canvas.getBoundingClientRect(); return { x: ev.clientX - r.left, y: ev.clientY - r.top }; }
-function nearestPoint(x, y) {
-  const tel = state.telemetryCache.get(state.mapDrawnFor); if (!tel || !state.mapProj) return null;
-  let bi = -1, bd = 26 * 26;
-  for (let i = 0; i < tel.lat.length; i++) { const p = toXY(state.mapProj, tel.lat[i], tel.lon[i], state.cssW, state.cssH, MAP_PAD); const d = (p.x - x) ** 2 + (p.y - y) ** 2; if (d < bd) { bd = d; bi = i; } }
-  if (bi < 0) return null;
-  const p = toXY(state.mapProj, tel.lat[bi], tel.lon[bi], state.cssW, state.cssH, MAP_PAD);
-  return { t: tel.t[bi], x: p.x, y: p.y };
+function redrawHover() {
+  if (!state.hoverMarker) return;
+  if (state.mapHover) {
+    state.hoverMarker.setLatLng([state.mapHover.lat, state.mapHover.lon]);
+    state.hoverMarker.setStyle({ opacity: 0.6 });
+  } else {
+    state.hoverMarker.setStyle({ opacity: 0 });
+  }
 }
-let mapDrag = false;
-function mapSeek(ev) { const { x, y } = mapXY(ev); const h = nearestPoint(x, y); if (h) { video.currentTime = h.t; state.mapHover = { x: h.x, y: h.y }; } return h; }
-canvas.addEventListener("pointerdown", (ev) => { if (ev.button) return; if (mapSeek(ev)) { mapDrag = true; canvas.setPointerCapture(ev.pointerId); } });
-canvas.addEventListener("pointermove", (ev) => { if (mapDrag) { mapSeek(ev); return; } const { x, y } = mapXY(ev); const h = nearestPoint(x, y); state.mapHover = h ? { x: h.x, y: h.y } : null; if (video.paused) redrawTrack(state.lastSample); });
-function endMapDrag(ev) { mapDrag = false; if (ev.type === "pointerleave") { state.mapHover = null; if (video.paused) redrawTrack(state.lastSample); } }
-canvas.addEventListener("pointerup", endMapDrag); canvas.addEventListener("pointercancel", endMapDrag); canvas.addEventListener("pointerleave", endMapDrag);
+
+/* click / drag to seek on the map: a fixed pixel hit-radius around the lap's
+ * own GPS points (like the old canvas version), converted through Leaflet's
+ * latLngToContainerPoint so it works at any zoom level. A hit on mousedown
+ * temporarily disables map panning so the drag seeks instead of panning;
+ * anywhere else, normal Leaflet pan/zoom behavior is left untouched. */
+const SEEK_HIT_PX = 26;
+function nearestTrackPoint(containerPoint) {
+  const tel = state.telemetryCache.get(state.mapDrawnFor);
+  if (!tel || !state.map) return null;
+  let bi = -1, bd = SEEK_HIT_PX * SEEK_HIT_PX;
+  for (let i = 0; i < tel.lat.length; i++) {
+    const p = state.map.latLngToContainerPoint([tel.lat[i], tel.lon[i]]);
+    const d = (p.x - containerPoint.x) ** 2 + (p.y - containerPoint.y) ** 2;
+    if (d < bd) { bd = d; bi = i; }
+  }
+  if (bi < 0) return null;
+  return { t: tel.t[bi], lat: tel.lat[bi], lon: tel.lon[bi] };
+}
+let mapDragSeek = false;
+function onMapMouseDown(e) {
+  if (e.originalEvent.button) return;
+  const hit = nearestTrackPoint(e.containerPoint);
+  if (!hit) return;
+  mapDragSeek = true;
+  state.map.dragging.disable();
+  video.currentTime = hit.t;
+  state.mapHover = { lat: hit.lat, lon: hit.lon };
+  redrawHover();
+}
+function onMapMouseMove(e) {
+  if (mapDragSeek) {
+    const hit = nearestTrackPoint(e.containerPoint);
+    if (hit) { video.currentTime = hit.t; state.mapHover = { lat: hit.lat, lon: hit.lon }; redrawHover(); }
+    return;
+  }
+  const hit = nearestTrackPoint(e.containerPoint);
+  state.mapHover = hit ? { lat: hit.lat, lon: hit.lon } : null;
+  redrawHover();
+}
+function onMapMouseUp() {
+  if (mapDragSeek) {
+    mapDragSeek = false;
+    // Only restore dragging in Free - in either Follow mode dragging is
+    // meant to stay off (the camera itself owns the view), so re-enabling
+    // it here would let a drag fight the next recenter.
+    if (state.cameraMode === "free") state.map.dragging.enable();
+  }
+}
+
+function initMap() {
+  let saved = "none";
+  try { saved = localStorage.getItem("rnv-map-style") || "none"; } catch (err) { /* ignore */ }
+  let savedCamera = "free";
+  try { savedCamera = localStorage.getItem("rnv-camera-mode") || "free"; } catch (err) { /* ignore */ }
+
+  state.map = L.map("track-map", {
+    center: [0, 0],
+    zoom: 2,
+    zoomControl: false,          // scroll/pinch/double-click zoom stay enabled
+    attributionControl: false,   // added back only when a tile layer is active
+    preferCanvas: true,
+    minZoom: 0,
+    maxZoom: 19,
+    // leaflet-rotate options - harmless no-ops if the plugin failed to load
+    // (core Leaflet just stores unknown options and ignores them).
+    rotate: true,
+    touchRotate: false,
+    rotateControl: false,
+  });
+  // Only present if leaflet-rotate patched L.Map with it - guards the
+  // heading-up mode everywhere it's used, so a missing/broken vendor file
+  // degrades to Free + follow-north instead of throwing.
+  state.rotateAvailable = typeof state.map.setBearing === "function";
+  state.cameraMode = savedCamera === "follow-heading" && !state.rotateAvailable ? "follow-north" : savedCamera;
+  state.attributionControl = L.control.attribution({ position: "bottomright", prefix: false });
+  state.trackRenderer = L.canvas({ padding: 0.5 });
+  state.trackLinesLayer = L.layerGroup().addTo(state.map);
+  state.trackLayer = L.layerGroup().addTo(state.map);
+  state.hoverMarker = L.circleMarker([0, 0], {
+    renderer: state.trackRenderer, radius: 7, color: HOVER_COLOR, weight: 1.5,
+    opacity: 0, fillOpacity: 0, interactive: false,
+  }).addTo(state.trackLayer);
+  state.positionMarker = L.marker([0, 0], {
+    icon: L.divIcon({ className: "track-pos-marker", html: '<div class="track-pos-arrow"></div>', iconSize: [18, 18], iconAnchor: [9, 9] }),
+    interactive: false, keyboard: false,
+  });
+
+  applyMapStyle(saved);
+
+  state.map.on("mousedown", onMapMouseDown);
+  state.map.on("mousemove", onMapMouseMove);
+  state.map.on("mouseup", onMapMouseUp);
+  state.map.getContainer().addEventListener("mouseleave", () => {
+    if (!mapDragSeek) { state.mapHover = null; redrawHover(); }
+  });
+  // In follow modes, dragging is off so wheel/pinch zoom is the only way the
+  // view can move - re-center on the car immediately after so zoom always
+  // reads as "zoom around the car", and remember the chosen zoom so the next
+  // updateCamera() frame (and any later re-entry into a follow mode) keeps it.
+  state.map.on("zoomend", () => {
+    if (state.cameraMode === "free") return;
+    state.followZoom = state.map.getZoom();
+    if (state.lastSample) state.map.panTo([state.lastSample.lat, state.lastSample.lon], { animate: false });
+  });
+}
 
 /* ================= G-ball ================= */
 function drawGBall(latG, lonG) {
@@ -442,14 +698,15 @@ function updateDisplay() {
     altValueEl.textContent = s.alt.toFixed(0);
     latgEl.textContent = signed(s.latG, 2); longEl.textContent = signed(s.lonG, 2);
     // corner name
-    const name = state.mapProj ? nearestCorner(s.lat, s.lon, state.mapProj.cosLat) : "";
+    const name = state.mapCosLat != null ? nearestCorner(s.lat, s.lon, state.mapCosLat) : "";
     hud.corner.textContent = name || "—"; hud.corner.classList.toggle("is-dim", !name);
     mapCornerEl.textContent = name || "—";
     // throttle / brake (derived from longitudinal G)
     if (s.lonG >= 0) { hud.throttle.style.width = (Math.min(1, s.lonG / 1.0) * 50) + "%"; hud.brake.style.width = "0%"; }
     else { hud.brake.style.width = (Math.min(1, -s.lonG / 1.2) * 50) + "%"; hud.throttle.style.width = "0%"; }
     drawGBall(s.latG, s.lonG);
-    redrawTrack(s);
+    updateCamera(s);
+    updatePositionMarker(s);
   }
   renderCharts(t);
   updateScrub();
@@ -463,17 +720,22 @@ video.addEventListener("durationchange", buildScrubTicks);
 /* ================= layout / sizing ================= */
 function layout() {
   const dpr = window.devicePixelRatio || 1; state.dpr = dpr;
-  const mp = canvas.parentElement; state.cssW = mp.clientWidth; state.cssH = mp.clientHeight;
-  canvas.width = Math.round(state.cssW * dpr); canvas.height = Math.round(state.cssH * dpr);
   gballCanvas.width = Math.round(116 * dpr); gballCanvas.height = Math.round(116 * dpr);
+  if (state.map) {
+    state.map.invalidateSize();
+    if (state.cameraMode !== "free" && state.lastSample) {
+      state.map.setView([state.lastSample.lat, state.lastSample.lon], state.map.getZoom(), { animate: false });
+    }
+  }
+  if (state.pendingBoundsPoints) { setupMapBounds(state.pendingBoundsPoints); state.pendingBoundsPoints = null; }
   const active = state.activeLapNumber;
   const tel = active != null ? state.telemetryCache.get(active) : null;
-  if (tel) { drawStaticTrack(tel); buildCharts(tel, state.laps.find((l) => l.lapNumber === active)); }
+  if (tel) buildCharts(tel, state.laps.find((l) => l.lapNumber === active));
   updateDisplay();
 }
 let roRaf = null;
 const ro = new ResizeObserver(() => { if (roRaf) return; roRaf = requestAnimationFrame(() => { roRaf = null; layout(); }); });
-ro.observe(canvas.parentElement); ro.observe($("chart-speed"));
+ro.observe($("track-map").parentElement); ro.observe($("chart-speed"));
 
 /* ================= startup / session loading ================= */
 async function loadTrack() {
@@ -482,7 +744,7 @@ async function loadTrack() {
     const data = await res.json();
     data.curves = data.curves.map((c) => Object.assign({}, c, { name: stripCurve(c.description) }));
     state.track = data;
-    if (state.mapDrawnFor != null) { drawStaticTrack(state.telemetryCache.get(state.mapDrawnFor)); redrawTrack(state.lastSample); }
+    drawTrackLines();
   } catch (err) { console.error("track fetch failed", err); }
 }
 
@@ -496,6 +758,23 @@ function resetSessionState() {
   state.mapDrawnFor = null;
   state.chartsBuiltFor = null;
   state.lastSample = null;
+  state.mapCosLat = null;
+  state.mapHover = null;
+  state.pendingBoundsPoints = null;
+  state.trackMinZoom = null;
+  state.trackPaddedBounds = null;
+  state.followZoom = null;
+  state.currentBearingDeg = 0;
+  if (state.trackPolyline) { state.trackLayer.removeLayer(state.trackPolyline); state.trackPolyline = null; }
+  if (state.trackLinesLayer) state.trackLinesLayer.clearLayers();
+  if (state.hoverMarker) state.hoverMarker.setStyle({ opacity: 0, fillOpacity: 0 });
+  if (state.map && state.positionMarker) state.map.removeLayer(state.positionMarker);
+  if (state.map) {
+    state.map.setMaxBounds(null);
+    state.map.setMinZoom(0);
+    state.map.dragging.enable();
+    if (state.rotateAvailable) state.map.setBearing(0);
+  }
   pillsEl.innerHTML = "";
   state.pillEls = [];
   $("session-date").textContent = "—";
@@ -504,15 +783,20 @@ function resetSessionState() {
 }
 
 /* Loads laps + track for whichever session the server currently has active
- * (called once at startup, and again every time a new session is selected). */
+ * (called once at startup, and again every time a new session is selected).
+ * Once both the reference lap's telemetry and the track geometry are in,
+ * the map is fitted/clamped to the track bounds (see setupMapBounds). */
 async function loadSessionData() {
   try {
     const res = await fetch("/api/laps"); if (!res.ok) throw new Error("HTTP " + res.status);
     state.laps = await res.json();
     buildPills(); refreshSessionDate();
-    loadTrack();
+    const trackPromise = loadTrack();
     const full = state.laps.find((l) => l.isFullLap) || state.laps[0];
-    if (full) { const data = await ensureTelemetry(full.lapNumber); if (data && state.activeLapNumber == null) { state.activeLapNumber = full.lapNumber; highlightPill(full.lapNumber); refreshKpis(); } }
+    let tel = null;
+    if (full) { tel = await ensureTelemetry(full.lapNumber); if (tel && state.activeLapNumber == null) { state.activeLapNumber = full.lapNumber; highlightPill(full.lapNumber); refreshKpis(); } }
+    await trackPromise;
+    if (tel) state.pendingBoundsPoints = collectBoundsPoints(tel);
     requestAnimationFrame(layout);
   } catch (err) { console.error("laps fetch failed", err); }
 }
@@ -722,7 +1006,7 @@ $("folder-toggle").addEventListener("click", () => openFolderPicker(true));
 
 /* ================= main startup ================= */
 async function init() {
-  buildMapToggle(); buildRates();
+  initMap(); buildMapToggle(); buildCameraToggle(); buildRates();
   drawGBall(null, null);
   try {
     const status = await fetchSessionStatus();

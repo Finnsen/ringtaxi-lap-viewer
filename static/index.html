@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>RingTaxi Onboard — Nürburgring</title>
+<link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -104,12 +105,13 @@
     <!-- RIGHT RAIL -->
     <aside class="rail">
       <div class="map-card">
-        <canvas id="track-canvas"></canvas>
+        <div id="track-map"></div>
         <div class="map-corner-wrap">
           <span class="map-corner-dot"></span>
           <span class="map-corner" id="map-corner">—</span>
         </div>
         <div class="map-toggle" id="map-toggle"></div>
+        <div class="camera-toggle" id="camera-toggle"></div>
         <div class="map-caption">GPS track · click or drag to seek</div>
       </div>
 
@@ -195,6 +197,8 @@
   </div>
 </div>
 
+<script src="/vendor/leaflet/leaflet.js"></script>
+<script src="/vendor/leaflet-rotate/leaflet-rotate.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>
