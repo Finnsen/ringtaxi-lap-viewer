@@ -156,6 +156,23 @@ html, body { margin: 0; height: 100%; background: var(--ink); color: var(--paper
 .hud--min .hud-speed { font-size: 30px; }
 .hud--min .hud-corner { font-size: 13px; }
 
+/* Fullscreen-only friction circle - positioned/sized in JS (see
+   layoutFullscreenGball in app.js) relative to the actual displayed video
+   content rect, so it lands in the gap of the footage's own burned-in
+   overlay bar. Hidden outside fullscreen; a subtle dark backdrop keeps it
+   legible on top of the video, matching .hud-accel-bar's look. */
+.hud-gball {
+  position: absolute;
+  display: none;
+  background: rgba(13,16,19,0.72);
+  border: 1px solid rgba(255,255,255,0.14);
+  border-radius: 10px;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.9);
+}
+.video-pane:fullscreen .hud-gball,
+.video-pane:-webkit-full-screen .hud-gball { display: block; }
+.hud-gball canvas { display: block; width: 100%; height: 100%; }
+
 /* ---------- transport ---------- */
 .transport { height: 52px; flex: none; display: flex; align-items: center; gap: 14px; padding: 0 16px; background: #0e1114; border-top: 1px solid var(--steel); }
 .play-btn { flex: none; width: 34px; height: 34px; border-radius: 50%; border: 1px solid var(--steel2); background: var(--graphite2); color: var(--paper); cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; }
@@ -173,6 +190,25 @@ html, body { margin: 0; height: 100%; background: var(--ink); color: var(--paper
 .rates { flex: none; display: flex; gap: 2px; }
 .rate-btn { font-family: var(--mono); font-size: 11px; padding: 5px 8px; border: 1px solid var(--steel2); border-radius: 5px; background: var(--graphite); color: var(--fog); cursor: pointer; }
 .rate-btn.is-active { background: var(--graphite2); color: var(--paper); border-color: #3a414a; }
+.fs-btn { flex: none; width: 34px; height: 34px; border-radius: 50%; border: 1px solid var(--steel2); background: var(--graphite2); color: var(--paper); cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; margin-left: auto; }
+.fs-btn:hover { background: #232830; }
+.fs-btn.is-active { border-color: var(--accent); color: var(--accent); }
+
+/* ---------- fullscreen (video pane only: video + HUD + transport) ---------- */
+.video-pane:fullscreen { width: 100vw; height: 100vh; }
+.video-pane:-webkit-full-screen { width: 100vw; height: 100vh; }
+.video-pane:fullscreen .hud-speed,
+.video-pane:-webkit-full-screen .hud-speed { font-size: 84px; }
+.video-pane:fullscreen .hud-corner,
+.video-pane:-webkit-full-screen .hud-corner { font-size: 20px; }
+.video-pane:fullscreen .hud-timecode,
+.video-pane:-webkit-full-screen .hud-timecode { font-size: 16px; }
+.video-pane:fullscreen .hud-onboard,
+.video-pane:-webkit-full-screen .hud-onboard { font-size: 13px; }
+.video-pane:fullscreen .hud-accel,
+.video-pane:-webkit-full-screen .hud-accel { width: 260px; }
+.video-pane:fullscreen .hud-speed-unit,
+.video-pane:-webkit-full-screen .hud-speed-unit { font-size: 18px; }
 
 /* ---------- right rail ---------- */
 .rail { display: grid; grid-template-rows: 1fr auto; gap: 1px; background: var(--steel); min-height: 0; }
