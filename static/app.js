@@ -42,6 +42,7 @@ const hud = { speed: $("hud-speed"), unit: $("hud-speed-unit"), corner: $("hud-c
 const altValueEl = $("alt-value"), latgEl = $("latg-value"), longEl = $("long-value");
 const mapCornerEl = $("map-corner");
 const gballCanvas = $("gball-canvas"), gctx = gballCanvas.getContext("2d");
+const fsGballWrap = $("hud-gball"), fsGballCanvas = $("hud-gball-canvas"), fsGctx = fsGballCanvas.getContext("2d");
 
 /* ---- formatting ---- */
 function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
@@ -531,18 +532,66 @@ function initMap() {
   });
 }
 
-/* ================= G-ball ================= */
-function drawGBall(latG, lonG) {
-  const dpr = state.dpr || 1, W = 116, H = 116; gctx.setTransform(dpr, 0, 0, dpr, 0, 0); gctx.clearRect(0, 0, W, H);
-  const cx = W / 2, cy = H / 2, rMax = W / 2 - 11, MAXG = 2, scale = rMax / MAXG;
-  gctx.strokeStyle = GRID; gctx.lineWidth = 1; gctx.beginPath(); gctx.moveTo(cx - rMax, cy); gctx.lineTo(cx + rMax, cy); gctx.moveTo(cx, cy - rMax); gctx.lineTo(cx, cy + rMax); gctx.stroke();
-  for (const g of [0.5, 1, 1.5]) { gctx.strokeStyle = g === 1 ? "#343a42" : GRID; gctx.beginPath(); gctx.arc(cx, cy, g * scale, 0, 7); gctx.stroke(); }
-  gctx.fillStyle = AXIS_TEXT; gctx.font = "9px ui-monospace, monospace"; gctx.textAlign = "left"; gctx.textBaseline = "bottom";
-  for (const g of [1, 1.5]) gctx.fillText(g.toFixed(1), cx + 3, cy - g * scale - 1);
+/* ================= G-ball =================
+ * Parameterized over ctx/size so the same routine can render either the
+ * always-on telemetry-panel canvas (116x116, with axis labels) or the
+ * smaller fullscreen HUD canvas (variable size, rings + dot only - see
+ * layoutFullscreenGball). All proportions below are derived from the size
+ * so both targets keep the same visual ratios as the original 116px design. */
+function drawGBall(ctx, W, H, latG, lonG, showLabels) {
+  if (showLabels == null) showLabels = true;
+  if (!W || !H) return;
+  const dpr = state.dpr || 1; ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, W, H);
+  const cx = W / 2, cy = H / 2, margin = W * (11 / 116), rMax = W / 2 - margin, MAXG = 2, scale = rMax / MAXG;
+  ctx.strokeStyle = GRID; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(cx - rMax, cy); ctx.lineTo(cx + rMax, cy); ctx.moveTo(cx, cy - rMax); ctx.lineTo(cx, cy + rMax); ctx.stroke();
+  for (const g of [0.5, 1, 1.5]) { ctx.strokeStyle = g === 1 ? "#343a42" : GRID; ctx.beginPath(); ctx.arc(cx, cy, g * scale, 0, 7); ctx.stroke(); }
+  if (showLabels) {
+    ctx.fillStyle = AXIS_TEXT; ctx.font = Math.round(W * (9 / 116)) + "px ui-monospace, monospace"; ctx.textAlign = "left"; ctx.textBaseline = "bottom";
+    for (const g of [1, 1.5]) ctx.fillText(g.toFixed(1), cx + 3, cy - g * scale - 1);
+  }
   if (latG == null) return;
   const gx = clamp(latG, -MAXG, MAXG), gy = clamp(lonG, -MAXG, MAXG), px = cx + gx * scale, py = cy - gy * scale;
-  gctx.beginPath(); gctx.arc(px, py, 7, 0, 7); gctx.fillStyle = "#131619"; gctx.fill();
-  gctx.beginPath(); gctx.arc(px, py, 5, 0, 7); gctx.fillStyle = ACCENT; gctx.fill();
+  const rOuter = W * (7 / 116), rInner = W * (5 / 116);
+  ctx.beginPath(); ctx.arc(px, py, rOuter, 0, 7); ctx.fillStyle = "#131619"; ctx.fill();
+  ctx.beginPath(); ctx.arc(px, py, rInner, 0, 7); ctx.fillStyle = ACCENT; ctx.fill();
+}
+
+/* Displayed video content rect (letterbox/pillarbox-aware), in videoWrap's
+ * own coordinate space - .hud has inset:0 over videoWrap, so these numbers
+ * double as the HUD's own coordinate space. Falls back to the full
+ * container box before video metadata has loaded. */
+function computeVideoContentRect() {
+  const cw = videoWrap.clientWidth, ch = videoWrap.clientHeight;
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!cw || !ch || !vw || !vh) return { x: 0, y: 0, width: cw, height: ch };
+  const containerAspect = cw / ch, videoAspect = vw / vh;
+  let dispW, dispH;
+  if (videoAspect > containerAspect) { dispW = cw; dispH = cw / videoAspect; }
+  else { dispH = ch; dispW = ch * videoAspect; }
+  return { x: (cw - dispW) / 2, y: (ch - dispH) / 2, width: dispW, height: dispH };
+}
+
+/* Placement of the fullscreen friction circle, measured from the RingTaxi
+ * footage's own burned-in overlay bar: centered at ~70% width / ~86% height
+ * of the *video content* (not the container), sized to ~17% of the video
+ * content height - this lands it in the gap between the burned-in
+ * "RingTaxi.de" logo and the burned-in track-map/speed readout, without
+ * covering either. Recomputed in layout() (covers resize/fullscreenchange)
+ * and again once video metadata (videoWidth/videoHeight) becomes available. */
+const FS_GBALL_CX = 0.70, FS_GBALL_CY = 0.86, FS_GBALL_SIZE_FRAC = 0.17;
+function layoutFullscreenGball() {
+  const rect = computeVideoContentRect();
+  const size = Math.max(40, Math.round(rect.height * FS_GBALL_SIZE_FRAC));
+  const cx = rect.x + rect.width * FS_GBALL_CX;
+  const cy = rect.y + rect.height * FS_GBALL_CY;
+  state.fsGballSize = size;
+  fsGballWrap.style.width = size + "px";
+  fsGballWrap.style.height = size + "px";
+  fsGballWrap.style.left = Math.round(cx - size / 2) + "px";
+  fsGballWrap.style.top = Math.round(cy - size / 2) + "px";
+  const dpr = state.dpr || window.devicePixelRatio || 1;
+  fsGballCanvas.width = Math.round(size * dpr);
+  fsGballCanvas.height = Math.round(size * dpr);
 }
 
 /* ================= charts ================= */
@@ -667,7 +716,46 @@ document.addEventListener("keydown", (e) => {
   if (e.code === "Space") { e.preventDefault(); if (video.paused) video.play().catch(() => {}); else video.pause(); }
   else if (e.code === "ArrowRight") { video.currentTime = Math.min((video.duration || 0), video.currentTime + 5); }
   else if (e.code === "ArrowLeft") { video.currentTime = Math.max(0, video.currentTime - 5); }
+  else if (e.code === "KeyF") { toggleFullscreen(); }
 });
+
+/* ================= fullscreen =================
+ * Fullscreen is requested on .video-pane (video + HUD + transport bar), not
+ * on the bare <video>, so our own HUD overlay and controls stay visible
+ * instead of the browser's native fullscreen video UI. The map/charts/rail
+ * simply aren't inside that element, so they're not shown - no extra hiding
+ * logic needed; their update loops keep running harmlessly in the background. */
+const videoPane = document.querySelector(".video-pane");
+const videoWrap = document.querySelector(".video-wrap");
+const fsBtn = $("fs-btn"), fsIcon = $("fs-icon");
+const FS_ICON_EXPAND = '<path d="M1 5V1h4M9 1h4v4M13 9v4H9M5 13H1V9"></path>';
+const FS_ICON_COMPRESS = '<path d="M5 1v4H1M9 1v4h4M13 9h-4v4M1 9h4v4"></path>';
+
+function fullscreenElement() { return document.fullscreenElement || document.webkitFullscreenElement || null; }
+function isPaneFullscreen() { return fullscreenElement() === videoPane; }
+function requestPaneFullscreen() {
+  if (videoPane.requestFullscreen) videoPane.requestFullscreen().catch(() => {});
+  else if (videoPane.webkitRequestFullscreen) videoPane.webkitRequestFullscreen();
+}
+function exitPaneFullscreen() {
+  if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+  else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+}
+function toggleFullscreen() { if (isPaneFullscreen()) exitPaneFullscreen(); else requestPaneFullscreen(); }
+function syncFullscreenButton() {
+  const active = isPaneFullscreen();
+  fsBtn.classList.toggle("is-active", active);
+  fsIcon.innerHTML = active ? FS_ICON_COMPRESS : FS_ICON_EXPAND;
+  fsBtn.title = active ? "Exit fullscreen (Esc)" : "Fullscreen (F)";
+}
+// Esc (or any other exit path) fires this natively - never assume state,
+// always read it back from the document and re-run layout so the map/charts
+// (hidden, not destroyed, during fullscreen) re-measure correctly.
+function onFullscreenChange() { syncFullscreenButton(); requestAnimationFrame(layout); }
+document.addEventListener("fullscreenchange", onFullscreenChange);
+document.addEventListener("webkitfullscreenchange", onFullscreenChange);
+fsBtn.addEventListener("click", toggleFullscreen);
+videoWrap.addEventListener("dblclick", toggleFullscreen);
 
 /* ================= corners ================= */
 function distanceMeters(lat1, lon1, lat2, lon2, cosLat) { const dLat = (lat1 - lat2) * 110574; const dLon = (lon1 - lon2) * 111320 * cosLat; return Math.sqrt(dLat * dLat + dLon * dLon); }
@@ -687,7 +775,11 @@ function updateDisplay() {
   const lap = findLapForTime(t); if (lap) setActiveLap(lap.lapNumber);
   const active = state.activeLapNumber;
   const tel = active != null ? state.telemetryCache.get(active) : null;
-  if (!tel) { hud.speed.textContent = "—"; altValueEl.textContent = "—"; drawGBall(null, null); updateScrub(); return; }
+  if (!tel) {
+    hud.speed.textContent = "—"; altValueEl.textContent = "—"; drawGBall(gctx, 116, 116, null, null);
+    if (isPaneFullscreen() && state.fsGballSize) drawGBall(fsGctx, state.fsGballSize, state.fsGballSize, null, null, false);
+    updateScrub(); return;
+  }
   if (state.mapDrawnFor !== active) drawStaticTrack(tel);
   if (state.chartsBuiltFor !== active) buildCharts(tel, state.laps.find((l) => l.lapNumber === active));
   const s = interpolate(tel, t); state.lastSample = s;
@@ -704,7 +796,8 @@ function updateDisplay() {
     // throttle / brake (derived from longitudinal G)
     if (s.lonG >= 0) { hud.throttle.style.width = (Math.min(1, s.lonG / 1.0) * 50) + "%"; hud.brake.style.width = "0%"; }
     else { hud.brake.style.width = (Math.min(1, -s.lonG / 1.2) * 50) + "%"; hud.throttle.style.width = "0%"; }
-    drawGBall(s.latG, s.lonG);
+    drawGBall(gctx, 116, 116, s.latG, s.lonG);
+    if (isPaneFullscreen() && state.fsGballSize) drawGBall(fsGctx, state.fsGballSize, state.fsGballSize, s.latG, s.lonG, false);
     updateCamera(s);
     updatePositionMarker(s);
   }
@@ -714,13 +807,14 @@ function updateDisplay() {
 function rafLoop() { updateDisplay(); state.rafId = video.paused ? null : requestAnimationFrame(rafLoop); }
 video.addEventListener("timeupdate", updateDisplay);
 video.addEventListener("seeked", updateDisplay);
-video.addEventListener("loadedmetadata", () => { buildScrubTicks(); updateScrub(); });
+video.addEventListener("loadedmetadata", () => { buildScrubTicks(); updateScrub(); layoutFullscreenGball(); });
 video.addEventListener("durationchange", buildScrubTicks);
 
 /* ================= layout / sizing ================= */
 function layout() {
   const dpr = window.devicePixelRatio || 1; state.dpr = dpr;
   gballCanvas.width = Math.round(116 * dpr); gballCanvas.height = Math.round(116 * dpr);
+  layoutFullscreenGball();
   if (state.map) {
     state.map.invalidateSize();
     if (state.cameraMode !== "free" && state.lastSample) {
@@ -1007,7 +1101,7 @@ $("folder-toggle").addEventListener("click", () => openFolderPicker(true));
 /* ================= main startup ================= */
 async function init() {
   initMap(); buildMapToggle(); buildCameraToggle(); buildRates();
-  drawGBall(null, null);
+  drawGBall(gctx, 116, 116, null, null);
   try {
     const status = await fetchSessionStatus();
     if (!status.active) { openFolderPicker(false); return; }

@@ -247,6 +247,17 @@ with a large speed readout, altitude, the name of the nearest Nürburgring
 corner, and a GPS map with a direction arrow for the current position
 (interpolated between measurement points, rotated to match the heading).
 
+### Fullscreen mode
+
+The video pane (video + HUD + transport controls) can go fullscreen via the
+fullscreen button in the transport bar, double-clicking the video, or the `F`
+key (ignored while typing in a text field). The HUD — speed, corner name,
+timecode, throttle/brake bar — stays visible and scales up slightly; the map,
+charts and lap list are simply outside the fullscreened element, so they're
+not shown but keep updating in the background. Press Esc (or the button
+again) to exit; the map and charts re-measure themselves automatically once
+back in the normal layout.
+
 ### Track lines and corner names on the map
 
 The start/finish line and the 3 sector lines (from `/api/track`) are drawn
