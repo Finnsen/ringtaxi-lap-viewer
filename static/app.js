@@ -199,10 +199,20 @@ function applyCameraMode(mode) {
  * interpolated position - called once per frame from updateDisplay via the
  * rAF loop, and again from updateDisplay on 'seeked'/'timeupdate' events so
  * a paused, scrubbed camera still lands on the right spot. No-op in Free. */
+const CAMERA_THROTTLE_MS = 1000 / 24;
+let lastCameraUpdateMs = 0;
 function updateCamera(dot) {
   if (!state.map) return;
   if (state.cameraMode !== "follow-north" && state.cameraMode !== "follow-heading") return;
   if (!dot) return;
+  // setView/setBearing force Leaflet to reposition every tile/pane, which is
+  // too expensive to do on every rAF (60fps) without stealing frames from
+  // video decode. Throttling here (but never while paused, so a scrub/seek
+  // still lands the camera immediately) keeps the pan/rotate visually smooth
+  // at a fraction of the cost.
+  const now = performance.now();
+  if (!video.paused && now - lastCameraUpdateMs < CAMERA_THROTTLE_MS) return;
+  lastCameraUpdateMs = now;
   if (state.cameraMode === "follow-heading" && state.rotateAvailable) {
     // Sign convention: L.Map#setBearing(deg) rotates the map's content
     // clockwise by `deg` (it feeds straight into a CSS `rotate(deg)` on the

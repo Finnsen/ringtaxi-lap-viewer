@@ -606,7 +606,7 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/video/"):
                 return self.handle_video(path[len("/video/"):])
             return self.handle_static(path)
-        except BrokenPipeError:
+        except (BrokenPipeError, ConnectionResetError):
             pass
 
     def do_POST(self):
@@ -801,7 +801,7 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 try:
                     self.wfile.write(chunk)
-                except BrokenPipeError:
+                except (BrokenPipeError, ConnectionResetError):
                     return
                 remaining -= len(chunk)
 
